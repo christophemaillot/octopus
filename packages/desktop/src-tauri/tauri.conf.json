@@ -1,0 +1,21 @@
+{
+  "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/main/crates/tauri-cli/schema.json",
+  "productName": "Octopus",
+  "version": "0.1.0",
+  "identifier": "com.octopus.desktop",
+  "build": {
+    "frontendDist": "../src",
+    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "",
+    "beforeBuildCommand": ""
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Octopus",
+        "width": 1200,
+        "height": 800
+      }
+    ]
+  }
+}
