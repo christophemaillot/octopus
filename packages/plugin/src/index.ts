@@ -1,26 +1,25 @@
 /**
- * Octopus Plugin — Bridge between Octopus desktop client and OpenClaw agents
+ * Octopus Plugin — Agent-side connector for Octopus Hub
  *
  * Architecture:
- *   Desktop Tauri  —WS—>  Hub Rust  —HTTP SSE—>  Plugin  —agent—>  OpenClaw
+ *   Desktop Tauri  ←WS→  Hub (hub.chrm.fr)  ←WS→  Plugin (this)
  *
- * The plugin exposes a WebSocket endpoint that the hub connects to.
- * Messages flow:
- *   hub → plugin → subagent run → hooks (llm_output, before_tool_call) → hub
+ * The plugin connects OUT to the hub (like a Telegram bot connects
+ * to Telegram's API). It announces its agents and routes messages
+ * between the hub and the local OpenClaw instance.
  *
- * Events sent to the hub follow the protocol in SPEC.md.
+ * The hub is the central message broker — similar to Telegram's API server.
  */
 
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { createPluginRuntimeStore } from "openclaw/plugin-sdk/runtime-store";
 import type { PluginRuntime } from "openclaw/plugin-sdk/runtime-store";
-import { WebSocketServer, WebSocket } from "ws";
+import WebSocket from "ws";
 import { randomUUID } from "node:crypto";
-import type { IncomingMessage, ServerResponse } from "node:http";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
-interface WsMessage {
+interface HubMessage {
   type: string;
   id?: string;
   agent?: string;
@@ -28,27 +27,13 @@ interface WsMessage {
   content?: string;
   model?: string;
   limit?: number;
-  sessions?: string[];
-}
-
-interface StreamEvent {
-  type: "chunk" | "done" | "tool_progress" | "error";
-  id?: string;
-  agent?: string;
-  session?: string;
-  content?: string;
+  code?: string;
+  message?: string;
   tool?: string;
   status?: string;
   summary?: string;
   index?: number;
-  usage?: {
-    input_tokens: number;
-    output_tokens: number;
-    context_pct: number;
-  };
-  model?: string;
-  code?: string;
-  message?: string;
+  usage?: { input_tokens: number; output_tokens: number; context_pct: number };
 }
 
 // ── Runtime store ────────────────────────────────────────────────────────────
@@ -58,295 +43,213 @@ const store = createPluginRuntimeStore<PluginRuntime>({
   errorMessage: "octopus plugin runtime not initialized",
 });
 
-// ── Active streams ───────────────────────────────────────────────────────────
-// runId → { hub connection, stream events accumulator }
-
-const activeRuns = new Map<string, { ws: WebSocket; events: StreamEvent[] }>();
-
 // ── Plugin entry ─────────────────────────────────────────────────────────────
 
 export default definePluginEntry({
   id: "octopus",
   name: "Octopus",
-  description: "Bridge between Octopus desktop client and OpenClaw agents",
+  description: "Bridge between Octopus Hub and local OpenClaw agents",
   register(api) {
-    const cfg = api.pluginConfig as { port?: number; authToken?: string };
-    const wsPort = cfg.port ?? 3701;
+    const cfg = api.pluginConfig as {
+      hubUrl?: string;
+      token?: string;
+      reconnectDelay?: number;
+    };
 
-    // ── Set up WebSocket server ──────────────────────────────────────────
-    // We attach the WSS to the Gateway's HTTP server via registerHttpRoute
-    // For now, start a standalone WS server on a separate port.
-    // (registerHttpRoute doesn't natively support WS upgrade, so we use a
-    //  separate port. In a future version, we can integrate with the Gateway.)
+    const hubUrl = cfg.hubUrl ?? "ws://hub.chrm.fr:3700";
+    const authToken = cfg.token ?? "";
+    const reconnectDelay = cfg.reconnectDelay ?? 5000;
 
-    const wss = new WebSocketServer({ port: wsPort });
-    api.logger.info(`octopus: WebSocket server listening on :${wsPort}`);
+    // Agents hosted on this instance
+    const localAgents: Array<{ id: string; label: string; model: string }> = [
+      {
+        id: "main",
+        label: "Basile",
+        model: api.runtime.agent.defaults.model,
+      },
+    ];
 
-    // Track authenticated connections
-    const connections = new Set<WebSocket>();
+    api.logger.info(`octopus: will connect to hub at ${hubUrl}`);
 
-    wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
-      api.logger.info(`octopus: new connection from ${req.socket.remoteAddress}`);
+    // ── Connection manager ─────────────────────────────────────────────
+    let ws: WebSocket | null = null;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let shuttingDown = false;
 
-      // The hub must send auth within 5 seconds
-      let authenticated = false;
-      const authTimer = setTimeout(() => {
-        if (!authenticated) {
-          ws.close(4001, "auth timeout");
-        }
-      }, 5000);
+    function connect() {
+      if (shuttingDown) return;
 
-      ws.on("message", (raw: Buffer) => {
-        let msg: WsMessage;
-        try {
-          msg = JSON.parse(raw.toString());
-        } catch {
-          sendError(ws, "invalid_json", "Invalid JSON");
-          return;
-        }
+      api.logger.info(`octopus: connecting to hub...`);
 
-        // ── Auth ──────────────────────────────────────────────────────
-        if (msg.type === "auth") {
-          if (cfg.authToken && msg.content !== cfg.authToken) {
-            ws.close(4001, "invalid token");
+      try {
+        ws = new WebSocket(hubUrl);
+
+        ws.on("open", () => {
+          api.logger.info("octopus: connected to hub");
+
+          // Authenticate
+          ws!.send(
+            JSON.stringify({
+              type: "auth",
+              role: "agent",
+              token: authToken,
+              agents: localAgents,
+            }),
+          );
+        });
+
+        ws.on("message", async (raw: Buffer) => {
+          let msg: HubMessage;
+          try {
+            msg = JSON.parse(raw.toString());
+          } catch {
             return;
           }
-          authenticated = true;
-          clearTimeout(authTimer);
-          ws.send(JSON.stringify({
-            type: "auth_ok",
-            user: "octopus",
-            agents: [], // will be populated from runtime
-          }));
-          connections.add(ws);
-          return;
-        }
 
-        if (!authenticated) {
-          sendError(ws, "auth_required", "Authenticate first");
-          return;
-        }
+          await handleHubMessage(msg, ws!, api);
+        });
 
-        // ── List agents ───────────────────────────────────────────────
-        if (msg.type === "list_agents") {
-          ws.send(JSON.stringify({
-            type: "agent_list",
-            agents: [
-              { id: "main", label: "Basile", model: api.runtime.agent.defaults.model, status: "idle" },
-              { id: "kip", label: "Kip", model: api.runtime.agent.defaults.model, status: "idle" },
-            ],
-          }));
-          return;
-        }
+        ws.on("close", (code: number, reason: Buffer) => {
+          api.logger.warn(
+            `octopus: hub disconnected (code=${code}, reason=${reason.toString()})`,
+          );
+          ws = null;
+          scheduleReconnect();
+        });
 
-        // ── Send message ──────────────────────────────────────────────
-        if (msg.type === "send_message") {
-          const msgId = msg.id ?? randomUUID();
-          const sessionKey = msg.session
-            ? `octopus:${msg.agent ?? "main"}:${msg.session}`
-            : `octopus:${msg.agent ?? "main"}:${randomUUID()}`;
-          const runId = randomUUID();
-
-          activeRuns.set(runId, { ws, events: [] });
-
-          // Notify hub that processing started
-          ws.send(JSON.stringify({
-            type: "agent_status",
-            agent: msg.agent ?? "main",
-            session: msg.session,
-            status: "thinking",
-          }));
-
-          // Launch subagent (fire-and-forget with promise tracking)
-          api.runtime.subagent
-            .run({
-              sessionKey,
-              message: msg.content ?? "",
-              model: msg.model,
-              deliver: false,
-            })
-            .then(async ({ runId: subRunId }) => {
-              const result = await api.runtime.subagent.waitForRun({
-                runId: subRunId,
-                timeoutMs: 120_000,
-              });
-
-              // Read final messages
-              const { messages } = await api.runtime.subagent.getSessionMessages({
-                sessionKey,
-                limit: 10,
-              });
-
-              const lastMsg = messages?.findLast((m: any) => m.role === "assistant");
-              const fullContent = lastMsg?.content ?? result?.output ?? "";
-
-              // Send final done event
-              ws.send(JSON.stringify({
-                type: "done",
-                id: msgId,
-                agent: msg.agent ?? "main",
-                session: msg.session,
-                content: fullContent,
-              }));
-
-              activeRuns.delete(runId);
-            })
-            .catch((err: Error) => {
-              ws.send(JSON.stringify({
-                type: "error",
-                id: msgId,
-                agent: msg.agent ?? "main",
-                session: msg.session,
-                code: "agent_error",
-                message: err.message,
-              }));
-              activeRuns.delete(runId);
-            });
-
-          return;
-        }
-
-        // ── Cancel ────────────────────────────────────────────────────
-        if (msg.type === "cancel") {
-          // Subagent cancellation isn't directly supported in the SDK yet.
-          // For v0.1, we acknowledge the cancel.
-          ws.send(JSON.stringify({
-            type: "done",
-            id: msg.id,
-            agent: msg.agent,
-            session: msg.session,
-            content: "[cancelled]",
-          }));
-          return;
-        }
-
-        // ── Get history ───────────────────────────────────────────────
-        if (msg.type === "get_history") {
-          const sessionKey = `octopus:${msg.agent ?? "main"}:${msg.session}`;
-          api.runtime.subagent
-            .getSessionMessages({ sessionKey, limit: msg.limit ?? 50 })
-            .then(({ messages }) => {
-              ws.send(JSON.stringify({
-                type: "history",
-                session: msg.session,
-                messages: messages ?? [],
-              }));
-            })
-            .catch((err: Error) => {
-              ws.send(JSON.stringify({
-                type: "error",
-                code: "session_not_found",
-                message: err.message,
-              }));
-            });
-          return;
-        }
-
-        sendError(ws, "unknown_type", `Unknown message type: ${msg.type}`);
-      });
-
-      ws.on("close", () => {
-        connections.delete(ws);
-        api.logger.info("octopus: connection closed");
-      });
-
-      ws.on("error", (err: Error) => {
-        api.logger.error(`octopus: websocket error: ${err.message}`);
-        connections.delete(ws);
-      });
-    });
-
-    wss.on("error", (err: Error) => {
-      api.logger.error(`octopus: wss error: ${err.message}`);
-    });
-
-    // ── Register hooks for streaming interception ─────────────────────
-    // These hooks capture subagent events and forward them to the hub
-    // connection associated with the run.
-
-    api.on("llm_output", async (event) => {
-      const runId = event.ctx.runId;
-      if (!runId) return;
-
-      // Check if any active run matches this subagent run
-      for (const [activeRunId, state] of activeRuns) {
-        const output = event.output as { text?: string } | undefined;
-        if (output?.text) {
-          try {
-            state.ws.send(JSON.stringify({
-              type: "chunk",
-              content: output.text,
-            }));
-          } catch {
-            // connection probably closed
-          }
-        }
+        ws.on("error", (err: Error) => {
+          api.logger.error(`octopus: hub websocket error: ${err.message}`);
+          ws?.close();
+          ws = null;
+          scheduleReconnect();
+        });
+      } catch (err) {
+        api.logger.error(`octopus: failed to connect: ${err}`);
+        scheduleReconnect();
       }
-    });
+    }
 
-    api.on("before_tool_call", async (event) => {
-      const runId = event.runId;
-      if (!runId) return;
+    function scheduleReconnect() {
+      if (shuttingDown || reconnectTimer) return;
+      api.logger.info(`octopus: reconnecting in ${reconnectDelay}ms...`);
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        connect();
+      }, reconnectDelay);
+    }
 
-      for (const [, state] of activeRuns) {
-        try {
-          state.ws.send(JSON.stringify({
-            type: "tool_progress",
-            tool: event.toolName,
-            status: "running",
-            params: event.params,
-          }));
-        } catch {
-          // connection probably closed
-        }
-      }
-    });
+    // ── Start connection ──────────────────────────────────────────────
+    connect();
 
-    api.on("after_tool_call", async (event) => {
-      for (const [, state] of activeRuns) {
-        try {
-          state.ws.send(JSON.stringify({
-            type: "tool_progress",
-            tool: event.toolName,
-            status: "completed",
-          }));
-        } catch {
-          // connection probably closed
-        }
-      }
-    });
-
-    // ── Register HTTP route for health check ──────────────────────────
-    api.registerHttpRoute({
-      path: "/octopus/health",
-      auth: "plugin",
-      match: "exact",
-      handler: async (_req: IncomingMessage, res: ServerResponse) => {
-        res.statusCode = 200;
-        res.setHeader("Content-Type", "application/json");
-        res.end(JSON.stringify({
-          status: "ok",
-          connections: connections.size,
-          active_runs: activeRuns.size,
-        }));
-        return true;
-      },
-    });
-
-    // ── Gateway lifecycle ─────────────────────────────────────────────
-    api.on("gateway_stop", async () => {
-      wss.close();
-      for (const ws of connections) {
-        ws.close(1001, "gateway shutting down");
-      }
-      connections.clear();
-      activeRuns.clear();
+    // ── Gateway lifecycle ──────────────────────────────────────────────
+    api.on("gateway_stop", () => {
+      shuttingDown = true;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      ws?.close(1001, "gateway shutting down");
     });
   },
 });
 
+// ── Message handler ──────────────────────────────────────────────────────────
+
+async function handleHubMessage(
+  msg: HubMessage,
+  ws: WebSocket,
+  api: any, // OpenClawPluginApi — using any for simplicity in v0.1
+) {
+  // Auth response from hub
+  if (msg.type === "auth_ok") {
+    api.logger.info("octopus: authenticated with hub");
+    return;
+  }
+
+  // Error from hub
+  if (msg.type === "error") {
+    api.logger.error(`octopus: hub error: ${msg.message}`);
+    return;
+  }
+
+  // ── send_message — hub wants this agent to process a message ─────────
+  if (msg.type === "send_message") {
+    const msgId = msg.id ?? randomUUID();
+    const agentId = msg.agent ?? "main";
+    const sessionKey = msg.session
+      ? `octopus:${agentId}:${msg.session}`
+      : `octopus:${agentId}:${randomUUID()}`;
+
+    api.logger.info(
+      `octopus: processing message for agent=${agentId} session=${sessionKey}`,
+    );
+
+    // Notify hub that processing started
+    sendToHub(ws, {
+      type: "agent_status",
+      agent: agentId,
+      status: "thinking",
+    });
+
+    try {
+      // Run subagent to process the message
+      const { runId } = await api.runtime.subagent.run({
+        sessionKey,
+        message: msg.content ?? "",
+        model: msg.model,
+        deliver: false,
+      });
+
+      const result = await api.runtime.subagent.waitForRun({
+        runId,
+        timeoutMs: 120_000,
+      });
+
+      // Get the assistant's final message
+      const { messages } = await api.runtime.subagent.getSessionMessages({
+        sessionKey,
+        limit: 10,
+      });
+
+      const lastMsg = messages?.findLast(
+        (m: any) => m.role === "assistant",
+      );
+      const fullContent = lastMsg?.content ?? result?.output ?? "";
+
+      sendToHub(ws, {
+        type: "done",
+        id: msgId,
+        agent: agentId,
+        session: msg.session,
+        content: fullContent,
+        usage: result?.usage,
+        model: result?.model,
+      });
+    } catch (err: any) {
+      api.logger.error(`octopus: agent error: ${err.message}`);
+      sendToHub(ws, {
+        type: "error",
+        id: msgId,
+        agent: agentId,
+        session: msg.session,
+        code: "agent_error",
+        message: err.message,
+      });
+    }
+
+    return;
+  }
+
+  // ── ping — respond with pong ────────────────────────────────────────
+  if (msg.type === "ping") {
+    sendToHub(ws, { type: "pong" });
+    return;
+  }
+
+  api.logger.warn(`octopus: unknown hub message type: ${msg.type}`);
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-function sendError(ws: WebSocket, code: string, message: string) {
-  ws.send(JSON.stringify({ type: "error", code, message }));
+function sendToHub(ws: WebSocket, msg: Record<string, unknown>) {
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(msg));
+  }
 }

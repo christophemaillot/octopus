@@ -1,7 +1,7 @@
 {
   "id": "octopus",
   "name": "Octopus",
-  "description": "Bridge between Octopus desktop client and OpenClaw agents — SSE endpoint + hooks for streaming, tool progress, and usage",
+  "description": "Agent-side connector for Octopus Hub — bridges local OpenClaw agents to the central hub",
   "contracts": {
     "tools": []
   },
@@ -11,14 +11,19 @@
   "configSchema": {
     "type": "object",
     "properties": {
-      "port": {
-        "type": "integer",
-        "description": "WebSocket port for hub connection",
-        "default": 3701
-      },
-      "authToken": {
+      "hubUrl": {
         "type": "string",
-        "description": "Bearer token for hub authentication"
+        "description": "WebSocket URL of the Octopus Hub (e.g. wss://hub.chrm.fr:3700)",
+        "default": "ws://hub.chrm.fr:3700"
+      },
+      "token": {
+        "type": "string",
+        "description": "Authentication token for the hub"
+      },
+      "reconnectDelay": {
+        "type": "integer",
+        "description": "Reconnect delay in ms",
+        "default": 5000
       }
     },
     "additionalProperties": false

@@ -1,12 +1,15 @@
-// Octopus Hub — pont WebSocket entre clients desktop et le plugin OpenClaw
+// Octopus Hub — central message broker (like Telegram API server)
 //
 // Architecture:
-//   Desktop Tauri  —WS :3700—>  Hub  —WS :3701—>  Plugin (OpenClaw)
+//   OpenClaw Agents (plugin)  ──WS──┐
+//                                    ├──→  Hub (hub.chrm.fr)  ←── Desktop Clients
+//   OpenClaw Pax            ──WS──┘
 //
-// Le hub :
-// 1. Maintient une connexion persistante vers le plugin OpenClaw
-// 2. Accepte les connexions des clients desktop
-// 3. Route les messages entre clients et plugin (via le champ `session`)
+// The hub:
+// - Accepts WS connections from agent plugins (outbound, like bots)
+// - Accepts WS connections from desktop clients (outbound, like users)
+// - Routes messages between clients and the right agent instance
+// - Knows which agents are on which connection
 
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
@@ -15,92 +18,90 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
-use tokio_tungstenite::connect_async;
+use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
-use url::Url;
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
 
 #[derive(Parser, Debug)]
 #[command(name = "octopus-hub", version)]
 struct Args {
-    /// Adresse du serveur WebSocket du plugin OpenClaw
-    #[arg(long, default_value = "ws://127.0.0.1:3701")]
-    upstream: String,
-
-    /// Port d'écoute pour les clients desktop
+    /// Port d'écoute
     #[arg(long, default_value_t = 3700)]
     port: u16,
 
-    /// Token d'authentification pour le plugin
+    /// Token d'auth requis pour les connexions
     #[arg(long)]
     token: Option<String>,
+
 }
 
-// ── Types sérialisables ──────────────────────────────────────────────────────
+// ── Message types ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct WsMessage {
     #[serde(rename = "type")]
     msg_type: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     agent: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    session: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    model: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    limit: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    status: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    summary: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    index: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    usage: Option<UsageInfo>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    code: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    message: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     agents: Option<Vec<AgentInfo>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    messages: Option<Vec<serde_json::Value>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    user: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct UsageInfo {
-    input_tokens: u32,
-    output_tokens: u32,
-    context_pct: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct AgentInfo {
     id: String,
     label: String,
-    #[serde(rename = "model")]
-    model_name: String,
-    status: String,
+    model: String,
 }
 
-// ── État partagé ─────────────────────────────────────────────────────────────
+// ── Connection types ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+enum PeerKind {
+    /// Plugin OpenClaw (héberge des agents)
+    Agent,
+    /// Client desktop
+    Client,
+}
+
+struct Peer {
+    id: String,
+    kind: PeerKind,
+    /// Pour un agent: les agents qu'il héberge (id → label)
+    hosted_agents: HashMap<String, AgentInfo>,
+    /// Canal pour envoyer des messages vers ce peer
+    tx: mpsc::UnboundedSender<Message>,
+}
+
+// ── Shared state ─────────────────────────────────────────────────────────────
 
 struct AppState {
-    /// Tâche d'écriture vers le plugin (broadcast)
-    plugin_tx: mpsc::UnboundedSender<Message>,
-    /// Connexions client actives (id → sender)
-    clients: Mutex<HashMap<String, mpsc::UnboundedSender<Message>>>,
-    /// Token d'auth pour le plugin
+    peers: Mutex<HashMap<String, Peer>>,
+    /// Index: agent_id → peer_id (pour routage rapide)
+    agent_routes: Mutex<HashMap<String, String>>,
     token: Option<String>,
 }
 
@@ -113,169 +114,295 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
-    tracing::info!("octopus-hub starting...");
+    tracing::info!("octopus-hub starting on :{}", args.port);
 
-    // 1. Connexion au plugin
-    let up_url = Url::parse(&args.upstream)?;
-    tracing::info!("connecting to plugin at {}", up_url);
-
-    let (plugin_ws, _) = connect_async(up_url.as_str()).await?;
-    let (mut plugin_writer, mut plugin_reader) = plugin_ws.split();
-
-    // Canal pour envoyer des messages au plugin
-    let (plugin_tx, mut plugin_rx) = mpsc::unbounded_channel::<Message>();
-
-    // Tâche : écriture vers le plugin
-    tokio::spawn(async move {
-        while let Some(msg) = plugin_rx.recv().await {
-            if let Err(e) = plugin_writer.send(msg).await {
-                tracing::error!("plugin send error: {e}");
-                break;
-            }
-        }
-    });
-
-    // 2. Authentification auprès du plugin
-    let auth_msg = serde_json::json!({
-        "type": "auth",
-        "content": args.token.as_deref().unwrap_or(""),
-    });
-    plugin_tx.send(Message::Text(auth_msg.to_string()))?;
-
-    tracing::info!("sent auth to plugin, waiting for auth_ok...");
-
-    // 3. État partagé
     let state = Arc::new(AppState {
-        plugin_tx,
-        clients: Mutex::new(HashMap::new()),
+        peers: Mutex::new(HashMap::new()),
+        agent_routes: Mutex::new(HashMap::new()),
         token: args.token,
     });
 
-    // 4. Tâche : lecture depuis le plugin (broadcast à tous les clients)
-    let state_b = state.clone();
-    tokio::spawn(async move {
-        while let Some(msg) = plugin_reader.next().await {
-            match msg {
-                Ok(Message::Text(text)) => {
-                    let clients: tokio::sync::MutexGuard<'_, HashMap<String, mpsc::UnboundedSender<Message>>> = state_b.clients.lock().await;
-                    for (_id, tx) in clients.iter() {
-                        let _ = tx.send(Message::Text(text.clone()));
-                    }
-                }
-                Ok(Message::Close(_)) => {
-                    tracing::warn!("plugin connection closed");
-                    break;
-                }
-                Ok(Message::Ping(_data)) => {
-                    // forwarded below if needed
-                }
-                Ok(Message::Pong(_)) => {}
-                Err(e) => {
-                    tracing::error!("plugin read error: {e}");
-                    break;
-                }
-                _ => {}
-            }
-        }
-        // Plugin disconnected — broadcast to all clients
-        let clients: tokio::sync::MutexGuard<'_, HashMap<String, mpsc::UnboundedSender<Message>>> = state_b.clients.lock().await;
-        for (_id, tx) in clients.iter() {
-            let _ = tx.send(Message::Text(
-                serde_json::json!({"type": "error", "code": "plugin_disconnected", "message": "Agent connection lost"}).to_string(),
-            ));
-        }
-        tracing::warn!("plugin reader task ended");
-    });
-
-    // 5. Accepteur de clients desktop
+    // Accepteur WS principal
     let listen_addr = format!("0.0.0.0:{}", args.port);
-    tracing::info!("listening for desktop clients on {listen_addr}");
-
     let listener = TcpListener::bind(&listen_addr).await?;
+    tracing::info!("listening on {listen_addr}");
 
     while let Ok((stream, addr)) = listener.accept().await {
-        tracing::info!("new client connection from {addr}");
         let state = state.clone();
-        tokio::spawn(handle_client(stream, addr, state));
+        tokio::spawn(handle_connection(stream, addr, state));
     }
 
     Ok(())
 }
 
-// ── Handler par client ────────────────────────────────────────────────────────
+// ── Connection handler ────────────────────────────────────────────────────────
 
-async fn handle_client(
+async fn handle_connection(
     stream: TcpStream,
     addr: std::net::SocketAddr,
     state: Arc<AppState>,
 ) {
-    let ws_stream = match tokio_tungstenite::accept_async(stream).await {
+    let ws_stream = match accept_async(stream).await {
         Ok(ws) => ws,
         Err(e) => {
-            tracing::error!("failed to accept WS from {addr}: {e}");
+            tracing::error!("ws accept error from {addr}: {e}");
             return;
         }
     };
 
-    let client_id = uuid_v4_simple();
     let (mut ws_writer, mut ws_reader) = ws_stream.split();
-
-    // Canal pour envoyer des messages à CE client
     let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+    let peer_id = format!("p{:x}", fast_rand());
 
-    // Enregistrer le client
-    {
-        let mut clients: tokio::sync::MutexGuard<'_, HashMap<String, mpsc::UnboundedSender<Message>>> = state.clients.lock().await;
-        clients.insert(client_id.clone(), tx);
-        tracing::debug!("client {client_id} registered ({addr})");
+    // ── Phase 1: Attendre auth ────────────────────────────────────────
+    let auth_message = loop {
+        match ws_reader.next().await {
+            Some(Ok(Message::Text(text))) => {
+                let msg: WsMessage = match serde_json::from_str(&text) {
+                    Ok(m) => m,
+                    Err(_) => {
+                        let _ = ws_writer
+                            .send(Message::Text(
+                                serde_json::json!({"type": "error", "code": "invalid_json", "message": "Invalid JSON"}).to_string(),
+                            ))
+                            .await;
+                        continue;
+                    }
+                };
+
+                if msg.msg_type == "auth" {
+                    break msg;
+                }
+
+                let _ = ws_writer
+                    .send(Message::Text(
+                        serde_json::json!({"type": "error", "code": "auth_required", "message": "Authenticate first"}).to_string(),
+                    ))
+                    .await;
+            }
+            Some(Ok(_)) => {}
+            Some(Err(e)) => {
+                tracing::debug!("{addr} auth read error: {e}");
+                return;
+            }
+            None => return,
+        }
+    };
+
+    // ── Phase 2: Valider auth ─────────────────────────────────────────
+    // Vérifier le token
+    let provided_token = auth_message.token.as_deref().unwrap_or("");
+    if let Some(expected) = &state.token {
+        if provided_token != expected {
+            let _ = ws_writer
+                .send(Message::Text(
+                    serde_json::json!({"type": "error", "code": "invalid_token", "message": "Invalid token"}).to_string(),
+                ))
+                .await;
+            tracing::warn!("{addr} invalid token");
+            return;
+        }
     }
 
-    // Tâche : écriture vers le client (reçoit les messages du plugin broadcastés)
-    let client_id_w = client_id.clone();
-    let write_handle = tokio::spawn(async move {
+    // Déterminer le type de peer
+    let kind = match auth_message.role.as_deref() {
+        Some("agent") => PeerKind::Agent,
+        _ => PeerKind::Client,
+    };
+
+    // Enregistrer
+    {
+        let mut peers = state.peers.lock().await;
+        let peer = Peer {
+            id: peer_id.clone(),
+            kind: kind.clone(),
+            hosted_agents: HashMap::new(),
+            tx: tx.clone(),
+        };
+        peers.insert(peer_id.clone(), peer);
+    }
+
+    // Si c'est un agent, enregistrer ses agents dans l'index
+    let mut hosted_agent_ids: Vec<String> = Vec::new();
+    if kind == PeerKind::Agent {
+        if let Some(agents) = &auth_message.agents {
+            let mut agent_routes = state.agent_routes.lock().await;
+            let mut peers = state.peers.lock().await;
+
+            for agent in agents {
+                agent_routes.insert(agent.id.clone(), peer_id.clone());
+                hosted_agent_ids.push(agent.id.clone());
+                tracing::info!("agent registered: {} ({})", agent.id, agent.label);
+            }
+
+            if let Some(peer) = peers.get_mut(&peer_id) {
+                for agent in agents {
+                    peer.hosted_agents
+                        .insert(agent.id.clone(), agent.clone());
+                }
+            }
+        }
+    }
+
+    // Répondre auth_ok
+    let kind_str = if kind == PeerKind::Agent { "agent" } else { "client" };
+    let ack = serde_json::json!({
+        "type": "auth_ok",
+        "peer_id": peer_id,
+        "kind": kind_str,
+    });
+    let _ = ws_writer.send(Message::Text(ack.to_string())).await;
+    tracing::info!("{addr} authenticated as {kind:?} (peer={peer_id})");
+
+    // ── Phase 3: Boucle de messages ───────────────────────────────────
+
+    let peer_id_r = peer_id.clone();
+    let state_r = state.clone();
+
+    // Tâche: écriture vers ce peer (messages entrants)
+    let write_task = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
-            if let Err(e) = ws_writer.send(msg).await {
-                tracing::debug!("client {client_id_w} write error: {e}");
+            if ws_writer.send(msg).await.is_err() {
                 break;
             }
         }
     });
 
-    // Lecture : messages du client → plugin
-    while let Some(msg) = ws_reader.next().await {
-        match msg {
-            Ok(Message::Text(text)) => {
-                // Forward raw text to plugin
-                if let Err(e) = state.plugin_tx.send(Message::Text(text.clone())) {
-                    tracing::error!("forward to plugin failed: {e}");
+    // Tâche: lecture depuis ce peer (messages sortants)
+    let read_task = tokio::spawn(async move {
+        while let Some(msg) = ws_reader.next().await {
+            match msg {
+                Ok(Message::Text(text)) => {
+                    let parsed: WsMessage = match serde_json::from_str(&text) {
+                        Ok(m) => m,
+                        Err(_) => continue,
+                    };
+                    route_message(parsed, &peer_id_r, &state_r).await;
+                }
+                Ok(Message::Close(_)) => break,
+                Ok(Message::Ping(_)) => {}
+                Ok(Message::Pong(_)) => {}
+                Ok(Message::Binary(_)) => {}
+                Ok(Message::Frame(_)) => {}
+                Err(e) => {
+                    tracing::debug!("peer {peer_id_r} read error: {e}");
                     break;
                 }
             }
-            Ok(Message::Close(_)) => break,
-            Ok(Message::Ping(data)) => {
-                let _ = state.plugin_tx.send(Message::Pong(data));
-            }
-            Err(e) => {
-                tracing::debug!("client {client_id} read error: {e}");
-                break;
-            }
-            _ => {}
         }
+    });
+
+    // Attendre que l'une des tâches se termine
+    tokio::select! {
+        _ = write_task => {},
+        _ = read_task => {},
     }
 
-    // Nettoyage
-    write_handle.abort();
-    let mut clients: tokio::sync::MutexGuard<'_, HashMap<String, mpsc::UnboundedSender<Message>>> = state.clients.lock().await;
-    clients.remove(&client_id);
-    tracing::info!("client {client_id} disconnected ({addr})");
+    // ── Nettoyage ─────────────────────────────────────────────────────
+    cleanup_peer(&peer_id, &hosted_agent_ids, &state).await;
+    tracing::info!("peer {peer_id} disconnected ({addr})");
+}
+
+// ── Routing ───────────────────────────────────────────────────────────────────
+
+async fn route_message(msg: WsMessage, sender_id: &str, state: &Arc<AppState>) {
+    match msg.msg_type.as_str() {
+        // Un client envoie un message vers un agent
+        "send_message" => {
+            let agent_id = msg.agent.as_deref().unwrap_or("main");
+            let agent_routes = state.agent_routes.lock().await;
+
+            if let Some(peer_id) = agent_routes.get(agent_id) {
+                let peers = state.peers.lock().await;
+                if let Some(peer) = peers.get(peer_id) {
+                    let _ = peer.tx.send(Message::Text(
+                        serde_json::to_string(&msg).unwrap(),
+                    ));
+                }
+            } else {
+                // Agent inconnu, renvoyer une erreur à l'émetteur
+                let peers = state.peers.lock().await;
+                if let Some(sender) = peers.get(sender_id) {
+                    let err = serde_json::json!({
+                        "type": "error",
+                        "code": "agent_unavailable",
+                        "message": format!("Agent '{agent_id}' is not connected"),
+                    });
+                    let _ = sender.tx.send(Message::Text(err.to_string()));
+                }
+            }
+        }
+
+        // Une réponse d'agent → broadcast à tous les clients
+        "chunk" | "done" | "tool_progress" | "agent_status" | "error" | "pong" => {
+            let peers = state.peers.lock().await;
+            for (peer_id, peer) in peers.iter() {
+                // Ne pas renvoyer à l'émetteur (agent)
+                if peer_id == sender_id {
+                    continue;
+                }
+                let _ = peer.tx.send(Message::Text(
+                    serde_json::to_string(&msg).unwrap(),
+                ));
+            }
+        }
+
+        // Un client demande la liste des agents
+        "list_agents" => {
+            let agent_routes = state.agent_routes.lock().await;
+            let peers = state.peers.lock().await;
+
+            let mut agent_list: Vec<AgentInfo> = Vec::new();
+            for (agent_id, peer_id) in agent_routes.iter() {
+                if let Some(peer) = peers.get(peer_id) {
+                    if let Some(info) = peer.hosted_agents.get(agent_id) {
+                        agent_list.push(info.clone());
+                    }
+                }
+            }
+
+            let peers = state.peers.lock().await;
+            if let Some(sender) = peers.get(sender_id) {
+                let resp = serde_json::json!({
+                    "type": "agent_list",
+                    "agents": agent_list,
+                });
+                let _ = sender.tx.send(Message::Text(resp.to_string()));
+            }
+        }
+
+        _ => {
+            tracing::warn!("unhandled message type: {}", msg.msg_type);
+        }
+    }
+}
+
+// ── Cleanup ───────────────────────────────────────────────────────────────────
+
+async fn cleanup_peer(
+    peer_id: &str,
+    hosted_agents: &[String],
+    state: &Arc<AppState>,
+) {
+    let mut agent_routes = state.agent_routes.lock().await;
+    for agent_id in hosted_agents {
+        if agent_routes.get(agent_id).map(|s| s == peer_id).unwrap_or(false) {
+            agent_routes.remove(agent_id);
+            tracing::info!("agent {agent_id} deregistered");
+        }
+    }
+    drop(agent_routes);
+
+    let mut peers = state.peers.lock().await;
+    peers.remove(peer_id);
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn uuid_v4_simple() -> String {
+fn fast_rand() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let now = SystemTime::now()
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    format!("c{:x}", now.as_nanos())
+        .unwrap_or_default()
+        .as_nanos() as u64
 }
