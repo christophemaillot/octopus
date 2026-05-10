@@ -1,8 +1,5 @@
 /**
  * Octopus Plugin — Agent-side connector for Octopus Hub
- *
- * Architecture:
- *   Desktop Tauri  ←WS→  Hub (hub.chrm.fr)  ←WS→  Plugin (this)
  */
 
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
@@ -22,28 +19,23 @@ export default definePluginEntry({
   name: "Octopus",
   description: "Bridge between Octopus Hub and local OpenClaw agents",
   register(api) {
-    const cfg = api.pluginConfig as {
-      hubUrl?: string;
-      token?: string;
-      reconnectDelay?: number;
-    };
+    const cfg = api.pluginConfig as { hubUrl?: string; token?: string; reconnectDelay?: number };
 
     const HUB_TOKEN = (() => {
-      try {
-        return readFileSync("/etc/octopus/hub.token", "utf8").trim();
-      } catch {
-        return cfg.token || "2ae22ad5b40778fa3ddaa465fcf03380";
-      }
+      try { return readFileSync("/etc/octopus/hub.token", "utf8").trim(); }
+      catch { return cfg.token || ""; }
     })();
-    const hubUrl = cfg.hubUrl ?? "wss://octopus.chrm.fr:443";
+
+    // Connect directly to the hub (not through nginx) for stability
+    const hubUrl = "ws://127.0.0.1:3700";
     const authToken = cfg.token || HUB_TOKEN;
-    const reconnectDelay = cfg.reconnectDelay ?? 5000;
+    const reconnectDelay = 3000;
 
     const localAgents = [
       { id: "main", label: "Basile", model: api.runtime.agent.defaults.model },
     ];
 
-    api.logger.info(`octopus: will connect to hub at ${hubUrl}`);
+    api.logger.info(`octopus: hubUrl=${hubUrl}`);
 
     // ── State ─────────────────────────────────────────────────────
     let ws: WebSocket | null = null;
@@ -54,14 +46,12 @@ export default definePluginEntry({
     let processingCount = 0;
 
     function sendJson(msg: Record<string, unknown>) {
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify(msg));
-      }
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      ws.send(JSON.stringify(msg));
     }
 
     function scheduleReconnect() {
       if (shuttingDown || connecting || processingCount > 0 || reconnectTimer) return;
-      api.logger.info(`octopus: reconnecting in ${reconnectDelay}ms...`);
       reconnectTimer = setTimeout(() => {
         reconnectTimer = null;
         connect();
@@ -73,8 +63,8 @@ export default definePluginEntry({
       if (ws && ws.readyState === WebSocket.OPEN) return;
 
       connecting = true;
-      api.logger.info("octopus: connecting to hub...");
 
+      // Close previous socket
       if (ws) {
         intentionalClose = true;
         try { ws.terminate(); } catch {}
@@ -87,12 +77,8 @@ export default definePluginEntry({
 
         ws.on("open", () => {
           connecting = false;
-          api.logger.info("octopus: connected to hub");
           ws!.send(JSON.stringify({
-            type: "auth",
-            role: "agent",
-            token: authToken,
-            agents: localAgents,
+            type: "auth", role: "agent", token: authToken, agents: localAgents,
           }));
         });
 
@@ -100,55 +86,67 @@ export default definePluginEntry({
           let msg: any;
           try { msg = JSON.parse(raw.toString()); } catch { return; }
 
-          if (msg.type === "auth_ok") {
-            api.logger.info("octopus: authenticated with hub");
-            return;
-          }
-
-          if (msg.type === "error") {
-            api.logger.error(`octopus: hub error: ${msg.message}`);
-            return;
-          }
+          if (msg.type === "auth_ok") return;
 
           if (msg.type === "send_message") {
             processingCount++;
             try {
-              await handleMessage(msg, api, sendJson);
-            } catch (err: any) {
-              api.logger.error(`octopus: handler error: ${err.message}`);
+              const msgId = msg.id ?? randomUUID();
+              const agentId = msg.agent ?? "main";
+              const sessionKey = msg.session
+                ? `octopus:${agentId}:${msg.session}`
+                : `octopus:${agentId}:${randomUUID()}`;
+
+              sendJson({ type: "agent_status", agent: agentId, status: "thinking" });
+
+              const subOptions: any = { sessionKey, message: msg.content ?? "", deliver: false };
+              if (msg.model) subOptions.model = msg.model;
+
+              const { runId } = await api.runtime.subagent.run(subOptions);
+              const result = await api.runtime.subagent.waitForRun({ runId, timeoutMs: 120_000 });
+              const { messages } = await api.runtime.subagent.getSessionMessages({ sessionKey, limit: 10 });
+              const lastMsg = messages?.findLast((m: any) => m.role === "assistant");
+              const content = lastMsg?.content ?? result?.output ?? "";
+
               sendJson({
-                type: "error",
-                id: msg.id,
-                code: "handler_error",
-                message: err.message,
+                type: "done", id: msgId, agent: agentId, session: msg.session,
+                content, usage: result?.usage, model: result?.model,
               });
-            } finally {
+
               processingCount--;
+              // Reconnect if disconnected during processing
+              if (!ws || ws.readyState !== WebSocket.OPEN) {
+                connecting = false;
+                scheduleReconnect();
+              }
+            } catch (err: any) {
+              api.logger.error(`octopus: error: ${err.message}`);
+              sendJson({ type: "error", code: "agent_error", message: err.message });
+              processingCount--;
+              scheduleReconnect();
             }
             return;
           }
 
-          api.logger.warn(`octopus: unknown hub message type: ${msg.type}`);
+          api.logger.warn(`octopus: unknown msg: ${msg.type}`);
         });
 
         ws.on("close", () => {
           connecting = false;
           if (intentionalClose) return;
-          api.logger.warn("octopus: hub disconnected");
           ws = null;
           scheduleReconnect();
         });
 
-        ws.on("error", (err: Error) => {
+        ws.on("error", () => {
           connecting = false;
-          api.logger.error(`octopus: hub error: ${err.message}`);
           try { ws?.terminate(); } catch {}
           ws = null;
           scheduleReconnect();
         });
+
       } catch (err) {
         connecting = false;
-        api.logger.error(`octopus: connect error: ${err}`);
         scheduleReconnect();
       }
     }
@@ -158,64 +156,7 @@ export default definePluginEntry({
     api.on("gateway_stop", () => {
       shuttingDown = true;
       if (reconnectTimer) clearTimeout(reconnectTimer);
-      if (ws) {
-        intentionalClose = true;
-        ws.close(1001, "gateway shutting down");
-      }
+      if (ws) { intentionalClose = true; ws.close(1001, "shutdown"); }
     });
   },
 });
-
-// ── Message handler ─────────────────────────────────────────────────
-
-async function handleMessage(
-  msg: any,
-  api: any,
-  send: (msg: Record<string, unknown>) => void,
-) {
-  const msgId = msg.id ?? randomUUID();
-  const agentId = msg.agent ?? "main";
-  const sessionKey = msg.session
-    ? `octopus:${agentId}:${msg.session}`
-    : `octopus:${agentId}:${randomUUID()}`;
-
-  api.logger.info(`octopus: processing message for agent=${agentId} session=${sessionKey}`);
-
-  // Notify hub
-  send({ type: "agent_status", agent: agentId, status: "thinking" });
-
-  try {
-    const subOptions: any = { sessionKey, message: msg.content ?? "", deliver: false };
-    if (msg.model) subOptions.model = msg.model;
-
-    const { runId } = await api.runtime.subagent.run(subOptions);
-    const result = await api.runtime.subagent.waitForRun({ runId, timeoutMs: 120_000 });
-
-    const { messages } = await api.runtime.subagent.getSessionMessages({
-      sessionKey,
-      limit: 10,
-    });
-
-    const lastMsg = messages?.findLast((m: any) => m.role === "assistant");
-    const fullContent = lastMsg?.content ?? result?.output ?? "";
-
-    send({
-      type: "done",
-      id: msgId,
-      agent: agentId,
-      session: msg.session,
-      content: fullContent,
-      usage: result?.usage,
-      model: result?.model,
-    });
-  } catch (err: any) {
-    api.logger.error(`octopus: agent error: ${err.message}`);
-    send({
-      type: "error",
-      id: msgId,
-      agent: agentId,
-      code: "agent_error",
-      message: err.message,
-    });
-  }
-}
