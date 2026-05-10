@@ -1,0 +1,26 @@
+# Octopus configuration
+# Located at ~/.config/octopus/octopus.toml
+
+[hub]
+url = "wss://octopus.chrm.fr"
+# Token for hub authentication
+token = ""
+
+# Avatar directory: avatars are loaded from ~/.config/octopus/avatars/<id>.png
+# Falls back to generated initials if not found.
+
+[[agents]]
+id = "basile"
+label = "Basile"
+model = "deepseek/deepseek-v4-flash"
+
+[[agents]]
+id = "kip"
+label = "Kip"
+model = "anthropic/claude-sonnet-4-6"
+
+# Add more agents as needed:
+# [[agents]]
+# id = "numi"
+# label = "Numi"
+# model = "openai/gpt-4.1"

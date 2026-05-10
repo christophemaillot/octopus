@@ -119,24 +119,22 @@ function ToolCallBadge({ call }: { call: ToolCall }) {
   );
 }
 
+import { marked } from "marked";
+
+// Configure marked for safe rendering
+marked.use({ gfm: true, breaks: true });
+
 function FormattedMessage({ content }: { content: string }) {
-  // Simple markdown-like formatting (code blocks, bold, inline code)
-  const parts = content.split(/(```[\s\S]*?```|`[^`]+`|\*\*[^*]+\*\*)/g);
-  return (
-    <>
-      {parts.map((part, i) => {
-        if (part.startsWith("```") && part.endsWith("```")) {
-          const code = part.slice(3, -3).replace(/^\w+\n/, ""); // strip optional lang
-          return <pre key={i}><code>{code}</code></pre>;
-        }
-        if (part.startsWith("`") && part.endsWith("`")) {
-          return <code key={i}>{part.slice(1, -1)}</code>;
-        }
-        if (part.startsWith("**") && part.endsWith("**")) {
-          return <strong key={i}>{part.slice(2, -2)}</strong>;
-        }
-        return <span key={i}>{part}</span>;
-      })}
-    </>
-  );
+  const html = marked.parse(content, { async: false }) as string;
+  return <div className="markdown" dangerouslySetInnerHTML={{ __html: sanitizeHtml(html) }} />;
+}
+
+// Strip dangerous HTML (scripts, event handlers, etc.)
+function sanitizeHtml(html: string): string {
+  return html
+    .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, "")
+    .replace(/\son\w+\s*=\s*"[^"]*"/gi, "")
+    .replace(/\son\w+\s*=\s*'[^']*'/gi, "")
+    .replace(/\son\w+\s*=\s*[^\s>]+/gi, "")
+    .replace(/javascript:/gi, "blocked:");
 }

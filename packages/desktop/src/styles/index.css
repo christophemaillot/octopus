@@ -335,6 +335,37 @@ html, body, #root {
   border-radius: 3px;
 }
 
+/* Markdown rendered content */
+.markdown p { margin: 0 0 8px; }
+.markdown p:last-child { margin-bottom: 0; }
+.markdown ul, .markdown ol { margin: 4px 0; padding-left: 20px; }
+.markdown li { margin: 2px 0; }
+.markdown h1, .markdown h2, .markdown h3, .markdown h4 {
+  margin: 12px 0 6px;
+  font-weight: 600;
+}
+.markdown h1 { font-size: 16px; }
+.markdown h2 { font-size: 15px; }
+.markdown h3 { font-size: 14px; }
+.markdown blockquote {
+  border-left: 3px solid var(--accent);
+  padding-left: 10px;
+  margin: 8px 0;
+  color: var(--text-dim);
+}
+.markdown table {
+  border-collapse: collapse;
+  margin: 8px 0;
+  font-size: 13px;
+  width: 100%;
+}
+.markdown th, .markdown td {
+  border: 1px solid var(--border);
+  padding: 6px 10px;
+  text-align: left;
+}
+.markdown th { background: rgba(255,255,255,0.05); }
+
 .msg-footer {
   font-size: 11px;
   color: var(--text-dim);

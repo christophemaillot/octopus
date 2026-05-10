@@ -6,9 +6,10 @@ interface SidebarProps {
   agentStatuses: Record<string, AgentStatus>;
   activeAgent: string | null;
   onSelectAgent: (id: string) => void;
+  agentLabels?: Record<string, string>;
 }
 
-export default function Sidebar({ agents, agentStatuses, activeAgent, onSelectAgent }: SidebarProps) {
+export default function Sidebar({ agents, agentStatuses, activeAgent, onSelectAgent, agentLabels }: SidebarProps) {
   const [open, setOpen] = useState(false);
 
   return (
@@ -18,18 +19,19 @@ export default function Sidebar({ agents, agentStatuses, activeAgent, onSelectAg
       </button>
       {agents.map((agent) => {
         const status = agentStatuses[agent.id] ?? "idle";
-        const initials = agent.label.slice(0, 2).toUpperCase();
+        const displayLabel = agentLabels?.[agent.id] ?? agent.label;
+        const initials = displayLabel.slice(0, 2).toUpperCase();
         return (
           <div key={agent.id} className="agent-item" style={open ? { width: "100%", padding: "8px 12px", display: "flex", alignItems: "center", gap: "8px" } : {}}>
             <button
               className={`agent-btn${activeAgent === agent.id ? " active" : ""}${status !== "idle" ? ` ${status}` : ""}`}
               onClick={() => onSelectAgent(agent.id)}
-              title={`${agent.label} (${agent.model})`}
+              title={`${displayLabel} (${agent.model})`}
             >
               {initials}
               <span className={`status-dot ${status}`} />
             </button>
-            {open && <span className="agent-label" style={{ fontSize: 13, marginTop: 0, maxWidth: "none" }}>{agent.label}</span>}
+            {open && <span className="agent-label" style={{ fontSize: 13, marginTop: 0, maxWidth: "none" }}>{displayLabel}</span>}
           </div>
         );
       })}

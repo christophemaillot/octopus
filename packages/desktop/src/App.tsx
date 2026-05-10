@@ -4,12 +4,16 @@ import Toolbar from "./components/Toolbar";
 import ThreadBar from "./components/ThreadBar";
 import ChatPane from "./components/ChatPane";
 import { useHub } from "./hooks/useHub";
+import { useConfig } from "./hooks/useConfig";
 import type { Thread, Message, ToolCall } from "./lib/types";
 
 const DEFAULT_MODEL = "deepseek/deepseek-v4-flash";
 
 export default function App() {
-  const { connected, agents, agentStatuses, sendMessage } = useHub();
+  const { config, loading: cfgLoading } = useConfig();
+  const { connected, agents, agentStatuses, sendMessage, onMessage } = useHub(
+    config?.hub ?? { url: "wss://octopus.chrm.fr", token: "" },
+  );
 
   // Active agent
   const [activeAgent, setActiveAgent] = useState<string | null>(null);
@@ -32,7 +36,13 @@ export default function App() {
     setActiveAgent(agents[0].id);
   }
 
-  const agentLabel = agents.find((a) => a.id === activeAgent)?.label ?? "";
+  const agentLabel =
+    config?.agents.find((a) => a.id === activeAgent)?.label ??
+    agents.find((a) => a.id === activeAgent)?.label ??
+    "";
+
+  const agentModel =
+    config?.agents.find((a) => a.id === activeAgent)?.model ?? model;
 
   const currentThreads = threads[activeAgent ?? ""] ?? [];
   const currentThread = currentThreads.find((t) => t.id === activeThread) ?? null;
@@ -69,6 +79,8 @@ export default function App() {
 
       const msgId = crypto.randomUUID();
       curMsgId.current = msgId;
+      curAgentRef.current = agentId;
+      curThreadRef.current = thread.id;
 
       // Add user message to thread
       const userMsg: Message = {
@@ -85,12 +97,9 @@ export default function App() {
         ),
       }));
 
-      // Clear streaming state
-      setStreamingContent("");
+      // Streaming state
+      setStreamingContent(null);
       setToolCalls([]);
-
-      // Create a placeholder for the assistant response
-      const assId = `assist-${msgId}`;
 
       // We'll attach to the WebSocket message handler for responses.
       // For now, use a one-time listener pattern via sendMessage callback.
@@ -177,6 +186,72 @@ export default function App() {
     return () => document.removeEventListener("keydown", handleKeyDown);
   }, [handleKeyDown]);
 
+  // ── Listen for streaming responses ────────────────────────────────
+  const streamBufRef = useRef("");
+  const curAgentRef = useRef<string | null>(null);
+  const curThreadRef = useRef<string | null>(null);
+
+  const handleStreamMsg = useCallback((msg: any) => {
+    switch (msg.type) {
+      case "chunk":
+        streamBufRef.current += msg.content ?? "";
+        setStreamingContent(streamBufRef.current);
+        break;
+      case "done":
+        if (msg.id && curMsgId.current === msg.id) {
+          const agentId = msg.agent ?? curAgentRef.current;
+          const threadId = curThreadRef.current;
+          const finalContent = streamBufRef.current || msg.content || "";
+
+          streamBufRef.current = "";
+          setStreamingContent(null);
+          setToolCalls([]);
+
+          if (agentId && threadId) {
+            const assMsg: Message = {
+              id: `assist-${msg.id}`,
+              role: "assistant",
+              content: finalContent,
+              usage: msg.usage,
+              model: msg.model,
+              timestamp: Date.now(),
+            };
+            setThreads((prev) => ({
+              ...prev,
+              [agentId]: (prev[agentId] ?? []).map((t) =>
+                t.id === threadId
+                  ? { ...t, messages: [...t.messages, assMsg] }
+                  : t
+              ),
+            }));
+          }
+
+          if (msg.usage) setContextPct(msg.usage.context_pct ?? 0);
+        }
+        break;
+      case "tool_progress":
+        setToolCalls((prev) => {
+          const filtered = prev.filter(
+            (t) => !(t.tool === msg.tool && t.status === "running"),
+          );
+          return [
+            ...filtered,
+            {
+              tool: msg.tool,
+              status: msg.status ?? "running",
+              summary: msg.summary,
+            },
+          ];
+        });
+        break;
+    }
+  }, []); // stable: uses refs, no deps needed
+
+  useEffect(() => {
+    const unsub = onMessage(handleStreamMsg);
+    return unsub;
+  }, [handleStreamMsg, onMessage]);
+
   // ── Split view: number of panes ────────────────────────────────────
   const [splitCount, setSplitCount] = useState(1);
 
@@ -187,6 +262,9 @@ export default function App() {
         agentStatuses={agentStatuses}
         activeAgent={activeAgent}
         onSelectAgent={handleSelectAgent}
+        agentLabels={Object.fromEntries(
+          (config?.agents ?? []).map((a) => [a.id, a.label])
+        )}
       />
 
       <div className="main">
