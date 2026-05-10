@@ -56,8 +56,8 @@ export default definePluginEntry({
       reconnectDelay?: number;
     };
 
-    const hubUrl = cfg.hubUrl ?? "ws://hub.chrm.fr:3700";
-    const authToken = cfg.token ?? "";
+    const hubUrl = process.env.OCTOPUS_HUB_URL ?? cfg.hubUrl ?? "wss://octopus.chrm.fr:443";
+    const authToken = process.env.OCTOPUS_HUB_TOKEN ?? cfg.token ?? "";
     const reconnectDelay = cfg.reconnectDelay ?? 5000;
 
     // Agents hosted on this instance
