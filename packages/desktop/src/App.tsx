@@ -5,12 +5,14 @@ import ThreadBar from "./components/ThreadBar";
 import ChatPane from "./components/ChatPane";
 import { useHub } from "./hooks/useHub";
 import { useConfig } from "./hooks/useConfig";
+import { usePersistence } from "./hooks/usePersistence";
 import type { Thread, Message, ToolCall } from "./lib/types";
 
 const DEFAULT_MODEL = "deepseek/deepseek-v4-flash";
+const SEND_DEBOUNCE_MS = 1500;
 
 export default function App() {
-  const { config, loading: cfgLoading } = useConfig();
+  const { config } = useConfig();
   const { connected, agents, agentStatuses, sendMessage, onMessage } = useHub(
     config?.hub ?? { url: "wss://octopus.chrm.fr", token: "" },
   );
@@ -20,6 +22,10 @@ export default function App() {
 
   // Threads per agent: agentId → Thread[]
   const [threads, setThreads] = useState<Record<string, Thread[]>>({});
+
+  // Load/save threads via persistence hook
+  const { loadThreads } = usePersistence(threads, setThreads);
+  const [loaded, setLoaded] = useState(false);
   const [activeThread, setActiveThread] = useState<string | null>(null);
 
   // Streaming state
@@ -28,8 +34,26 @@ export default function App() {
   const [contextPct, setContextPct] = useState(0);
   const [model, setModel] = useState(DEFAULT_MODEL);
 
-  // Track the current message ID being streamed
+  // Refs for stable streaming
   const curMsgId = useRef<string | null>(null);
+  const streamBufRef = useRef("");
+  const curAgentRef = useRef<string | null>(null);
+  const curThreadRef = useRef<string | null>(null);
+
+  // Send debounce refs
+  const sendTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingTextRef = useRef<string | null>(null);
+  const inputVersionRef = useRef(0);
+  const sendVersionRef = useRef(0);
+
+  // Load persisted threads on mount
+  useEffect(() => {
+    if (!loaded && agents.length > 0) {
+      const saved = loadThreads();
+      if (saved) setThreads(saved);
+      setLoaded(true);
+    }
+  }, [loaded, agents, loadThreads]);
 
   // Default to first agent
   if (!activeAgent && agents.length > 0) {
@@ -64,25 +88,21 @@ export default function App() {
     return thread;
   }, []);
 
-  // ── Send message ──────────────────────────────────────────────────
-  const handleSend = useCallback(
+  // ── Actually send the message ────────────────────────────────────
+  const doSend = useCallback(
     (content: string) => {
       if (!activeAgent) return;
 
       const agentId = activeAgent;
       let thread = currentThread;
 
-      // Auto-create thread if none active
-      if (!thread) {
-        thread = createThread(agentId);
-      }
+      if (!thread) thread = createThread(agentId);
 
       const msgId = crypto.randomUUID();
       curMsgId.current = msgId;
       curAgentRef.current = agentId;
       curThreadRef.current = thread.id;
 
-      // Add user message to thread
       const userMsg: Message = {
         id: `user-${msgId}`,
         role: "user",
@@ -93,53 +113,96 @@ export default function App() {
       setThreads((prev) => ({
         ...prev,
         [agentId]: prev[agentId].map((t) =>
-          t.id === thread!.id ? { ...t, messages: [...t.messages, userMsg], title: content.slice(0, 40) } : t
+          t.id === thread!.id
+            ? { ...t, messages: [...t.messages, userMsg], title: content.slice(0, 40) }
+            : t,
         ),
       }));
 
-      // Streaming state
       setStreamingContent(null);
       setToolCalls([]);
+      streamBufRef.current = "";
 
-      // We'll attach to the WebSocket message handler for responses.
-      // For now, use a one-time listener pattern via sendMessage callback.
       sendMessage({
         type: "send_message",
         id: msgId,
         agent: agentId,
         session: thread.id,
         content,
-        model,
+        model: agentModel,
       });
-
-      // Poll for response via a one-shot onmessage handler isn't great,
-      // but for v0.1 we'll manage it via the hook's ref pattern.
-      // The real streaming will come when we implement the plugin's chunk streaming.
     },
-    [activeAgent, currentThread, createThread, sendMessage, model]
+    [activeAgent, currentThread, createThread, sendMessage, agentModel],
   );
 
-  // ── Cancel ────────────────────────────────────────────────────────
+  // ── Debounced send ──────────────────────────────────────────────
+  const queueSend = useCallback((text: string) => {
+    const version = ++sendVersionRef.current;
+    pendingTextRef.current = text;
+
+    if (sendTimerRef.current) clearTimeout(sendTimerRef.current);
+
+    sendTimerRef.current = setTimeout(() => {
+      if (sendVersionRef.current === version) {
+        doSend(text);
+        pendingTextRef.current = null;
+        sendTimerRef.current = null;
+      }
+    }, SEND_DEBOUNCE_MS);
+  }, [doSend]);
+
+  // If the user keeps typing after pressing Enter, cancel the pending send
+  const notifyInputChange = useCallback(() => {
+    const v = ++inputVersionRef.current;
+    if (sendTimerRef.current && pendingTextRef.current) {
+      // Only cancel if the user actually typed more (not just cursor move)
+      // This is signaled by ChatPane calling this on input changes
+      if (v > sendVersionRef.current + 1) {
+        clearTimeout(sendTimerRef.current);
+        sendTimerRef.current = null;
+        pendingTextRef.current = null;
+      }
+    }
+  }, []);
+
+  const handleSend = useCallback(
+    (content: string, immediate = false) => {
+      if (immediate) {
+        if (sendTimerRef.current) clearTimeout(sendTimerRef.current);
+        sendTimerRef.current = null;
+        pendingTextRef.current = null;
+        doSend(content);
+      } else {
+        queueSend(content);
+      }
+    },
+    [doSend, queueSend],
+  );
+
+  // ── Cancel ──────────────────────────────────────────────────────
   const handleCancel = useCallback(() => {
     if (curMsgId.current && activeAgent) {
-      sendMessage({ type: "cancel", id: curMsgId.current, agent: activeAgent, session: activeThread ?? undefined });
+      sendMessage({
+        type: "cancel",
+        id: curMsgId.current,
+        agent: activeAgent,
+        session: activeThread ?? undefined,
+      });
     }
     setStreamingContent(null);
     setToolCalls([]);
+    streamBufRef.current = "";
   }, [activeAgent, activeThread, sendMessage]);
 
-  // ── Select agent ───────────────────────────────────────────────────
-  const handleSelectAgent = useCallback(
-    (id: string) => {
-      setActiveAgent(id);
-      setActiveThread(null);
-      setStreamingContent(null);
-      setToolCalls([]);
-    },
-    []
-  );
+  // ── Select agent ─────────────────────────────────────────────────
+  const handleSelectAgent = useCallback((id: string) => {
+    setActiveAgent(id);
+    setActiveThread(null);
+    setStreamingContent(null);
+    setToolCalls([]);
+  }, []);
 
-  // ── Keyboard shortcuts ───────────────────────────────────────────
+  // ── Keyboard shortcuts ──────────────────────────────────────────
   const handleKeyDown = useCallback(
     (e: KeyboardEvent) => {
       const mod = e.metaKey || e.ctrlKey;
@@ -186,11 +249,7 @@ export default function App() {
     return () => document.removeEventListener("keydown", handleKeyDown);
   }, [handleKeyDown]);
 
-  // ── Listen for streaming responses ────────────────────────────────
-  const streamBufRef = useRef("");
-  const curAgentRef = useRef<string | null>(null);
-  const curThreadRef = useRef<string | null>(null);
-
+  // ── Streaming responses ─────────────────────────────────────────
   const handleStreamMsg = useCallback((msg: any) => {
     switch (msg.type) {
       case "chunk":
@@ -206,6 +265,7 @@ export default function App() {
           streamBufRef.current = "";
           setStreamingContent(null);
           setToolCalls([]);
+          setContextPct(msg.usage?.context_pct ?? 0);
 
           if (agentId && threadId) {
             const assMsg: Message = {
@@ -221,12 +281,10 @@ export default function App() {
               [agentId]: (prev[agentId] ?? []).map((t) =>
                 t.id === threadId
                   ? { ...t, messages: [...t.messages, assMsg] }
-                  : t
+                  : t,
               ),
             }));
           }
-
-          if (msg.usage) setContextPct(msg.usage.context_pct ?? 0);
         }
         break;
       case "tool_progress":
@@ -236,24 +294,20 @@ export default function App() {
           );
           return [
             ...filtered,
-            {
-              tool: msg.tool,
-              status: msg.status ?? "running",
-              summary: msg.summary,
-            },
+            { tool: msg.tool, status: msg.status ?? "running", summary: msg.summary },
           ];
         });
         break;
     }
-  }, []); // stable: uses refs, no deps needed
+  }, []);
 
   useEffect(() => {
     const unsub = onMessage(handleStreamMsg);
     return unsub;
   }, [handleStreamMsg, onMessage]);
 
-  // ── Split view: number of panes ────────────────────────────────────
-  const [splitCount, setSplitCount] = useState(1);
+  // ── Split view ──────────────────────────────────────────────────
+  const [splitCount] = useState(1);
 
   return (
     <div className="app">
@@ -263,7 +317,7 @@ export default function App() {
         activeAgent={activeAgent}
         onSelectAgent={handleSelectAgent}
         agentLabels={Object.fromEntries(
-          (config?.agents ?? []).map((a) => [a.id, a.label])
+          (config?.agents ?? []).map((a) => [a.id, a.label]),
         )}
       />
 
@@ -292,6 +346,7 @@ export default function App() {
               toolCalls={toolCalls}
               onSend={handleSend}
               onCancel={handleCancel}
+              onInputChange={notifyInputChange}
             />
           ))}
         </div>

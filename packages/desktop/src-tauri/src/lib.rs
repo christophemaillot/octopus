@@ -14,6 +14,8 @@ pub fn run() {
             greet,
             config::read_config,
             config::avatar_exists,
+            config::save_threads,
+            config::load_threads,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

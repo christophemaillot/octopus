@@ -1,6 +1,7 @@
 // Octopus Desktop — config reader
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::fs;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct OctopusConfig {
@@ -104,4 +105,31 @@ pub fn read_config() -> OctopusConfig {
 #[tauri::command]
 pub fn avatar_exists(agent_id: String) -> bool {
     avatar_path(&agent_id).exists()
+}
+
+// ── Session persistence ─────────────────────────────────────────────────
+
+fn sessions_dir() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("octopus")
+        .join("sessions")
+}
+
+#[tauri::command]
+pub fn save_threads(data: String) -> Result<(), String> {
+    let dir = sessions_dir();
+    fs::create_dir_all(&dir).map_err(|e| format!("create dir: {e}"))?;
+    let path = dir.join("threads.json");
+    fs::write(&path, &data).map_err(|e| format!("write: {e}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn load_threads() -> Result<Option<String>, String> {
+    let path = sessions_dir().join("threads.json");
+    match fs::read_to_string(&path) {
+        Ok(content) => Ok(Some(content)),
+        Err(_) => Ok(None),
+    }
 }
