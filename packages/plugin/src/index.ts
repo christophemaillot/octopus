@@ -1,13 +1,11 @@
-/**
- * Octopus Plugin — Agent-side connector for Octopus Hub
- */
-
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { createPluginRuntimeStore } from "openclaw/plugin-sdk/runtime-store";
 import type { PluginRuntime } from "openclaw/plugin-sdk/runtime-store";
 import WebSocket from "ws";
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
+
+let GLOBAL_LOCK = false;
 
 const store = createPluginRuntimeStore<PluginRuntime>({
   pluginId: "octopus",
@@ -19,136 +17,80 @@ export default definePluginEntry({
   name: "Octopus",
   description: "Bridge between Octopus Hub and local OpenClaw agents",
   register(api) {
-    const cfg = api.pluginConfig as { hubUrl?: string; token?: string; reconnectDelay?: number };
+    if (GLOBAL_LOCK) return;
+    GLOBAL_LOCK = true;
 
+    const cfg = api.pluginConfig as any;
     const HUB_TOKEN = (() => {
       try { return readFileSync("/etc/octopus/hub.token", "utf8").trim(); }
-      catch { return cfg.token || ""; }
+      catch { return cfg?.token || ""; }
     })();
 
-    // Connect directly to the hub (not through nginx) for stability
     const hubUrl = "ws://127.0.0.1:3700";
-    const authToken = cfg.token || HUB_TOKEN;
-    const reconnectDelay = 3000;
+    const authToken = cfg?.token || HUB_TOKEN;
 
-    const localAgents = [
-      { id: "main", label: "Basile", model: api.runtime.agent.defaults.model },
-    ];
+    api.logger.info(`octopus: starting (url=${hubUrl})`);
 
-    api.logger.info(`octopus: hubUrl=${hubUrl}`);
-
-    // ── State ─────────────────────────────────────────────────────
-    let ws: WebSocket | null = null;
-    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let ws = null as WebSocket | null;
+    let reconnectTimer = null as ReturnType<typeof setTimeout> | null;
     let shuttingDown = false;
     let connecting = false;
     let intentionalClose = false;
-    let processingCount = 0;
+    let processing = false;
 
-    function sendJson(msg: Record<string, unknown>) {
-      if (!ws || ws.readyState !== WebSocket.OPEN) return;
-      ws.send(JSON.stringify(msg));
-    }
-
-    function scheduleReconnect() {
-      if (shuttingDown || connecting || processingCount > 0 || reconnectTimer) return;
-      reconnectTimer = setTimeout(() => {
-        reconnectTimer = null;
-        connect();
-      }, reconnectDelay);
+    function send(msg: Record<string, unknown>) {
+      if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
     }
 
     function connect() {
-      if (shuttingDown || connecting || processingCount > 0) return;
-      if (ws && ws.readyState === WebSocket.OPEN) return;
-
+      if (shuttingDown || connecting || processing) return;
+      if (ws?.readyState === WebSocket.OPEN) return;
       connecting = true;
-
-      // Close previous socket
-      if (ws) {
-        intentionalClose = true;
-        try { ws.terminate(); } catch {}
-        intentionalClose = false;
-        ws = null;
-      }
+      if (ws) { intentionalClose = true; ws.terminate(); intentionalClose = false; ws = null; }
 
       try {
         ws = new WebSocket(hubUrl);
-
-        ws.on("open", () => {
+        ws.onopen = () => {
           connecting = false;
-          ws!.send(JSON.stringify({
-            type: "auth", role: "agent", token: authToken, agents: localAgents,
-          }));
-        });
-
-        ws.on("message", async (raw: Buffer) => {
+          ws!.send(JSON.stringify({ type: "auth", role: "agent", token: authToken, agents: [{ id: "main", label: "Basile", model: api.runtime.agent.defaults.model }] }));
+        };
+        ws.onmessage = async (raw) => {
           let msg: any;
           try { msg = JSON.parse(raw.toString()); } catch { return; }
+          if (msg.type !== "send_message") return;
 
-          if (msg.type === "auth_ok") return;
+          processing = true;
+          try {
+            const msgId = msg.id || randomUUID();
+            const agentId = msg.agent || "main";
+            const sessionKey = `octopus:${agentId}:${msg.session || randomUUID()}`;
+            send({ type: "agent_status", agent: agentId, status: "thinking" });
 
-          if (msg.type === "send_message") {
-            processingCount++;
-            try {
-              const msgId = msg.id ?? randomUUID();
-              const agentId = msg.agent ?? "main";
-              const sessionKey = msg.session
-                ? `octopus:${agentId}:${msg.session}`
-                : `octopus:${agentId}:${randomUUID()}`;
+            const opts: any = { sessionKey, message: msg.content || "", deliver: false };
+            if (msg.model) opts.model = msg.model;
 
-              sendJson({ type: "agent_status", agent: agentId, status: "thinking" });
+            const { runId } = await api.runtime.subagent.run(opts);
+            const result = await api.runtime.subagent.waitForRun({ runId, timeoutMs: 120_000 });
+            const { messages: msgs } = await api.runtime.subagent.getSessionMessages({ sessionKey, limit: 10 });
+            const last = msgs?.findLast((m: any) => m.role === "assistant");
 
-              const subOptions: any = { sessionKey, message: msg.content ?? "", deliver: false };
-              if (msg.model) subOptions.model = msg.model;
-
-              const { runId } = await api.runtime.subagent.run(subOptions);
-              const result = await api.runtime.subagent.waitForRun({ runId, timeoutMs: 120_000 });
-              const { messages } = await api.runtime.subagent.getSessionMessages({ sessionKey, limit: 10 });
-              const lastMsg = messages?.findLast((m: any) => m.role === "assistant");
-              const content = lastMsg?.content ?? result?.output ?? "";
-
-              sendJson({
-                type: "done", id: msgId, agent: agentId, session: msg.session,
-                content, usage: result?.usage, model: result?.model,
-              });
-
-              processingCount--;
-              // Reconnect if disconnected during processing
-              if (!ws || ws.readyState !== WebSocket.OPEN) {
-                connecting = false;
-                scheduleReconnect();
-              }
-            } catch (err: any) {
-              api.logger.error(`octopus: error: ${err.message}`);
-              sendJson({ type: "error", code: "agent_error", message: err.message });
-              processingCount--;
-              scheduleReconnect();
-            }
-            return;
+            send({ type: "done", id: msgId, agent: agentId, content: last?.content || result?.output || "", usage: result?.usage, model: result?.model });
+          } catch (e: any) {
+            api.logger.error(`octopus: ${e.message}`);
+            send({ type: "error", code: "agent_error", message: e.message });
+          } finally {
+            processing = false;
+            if (ws?.readyState !== WebSocket.OPEN) scheduleReconnect();
           }
+        };
+        ws.onclose = () => { connecting = false; if (intentionalClose) return; ws = null; scheduleReconnect(); };
+        ws.onerror = () => { connecting = false; ws?.terminate(); ws = null; scheduleReconnect(); };
+      } catch { connecting = false; scheduleReconnect(); }
+    }
 
-          api.logger.warn(`octopus: unknown msg: ${msg.type}`);
-        });
-
-        ws.on("close", () => {
-          connecting = false;
-          if (intentionalClose) return;
-          ws = null;
-          scheduleReconnect();
-        });
-
-        ws.on("error", () => {
-          connecting = false;
-          try { ws?.terminate(); } catch {}
-          ws = null;
-          scheduleReconnect();
-        });
-
-      } catch (err) {
-        connecting = false;
-        scheduleReconnect();
-      }
+    function scheduleReconnect() {
+      if (shuttingDown || connecting || processing || reconnectTimer) return;
+      reconnectTimer = setTimeout(() => { reconnectTimer = null; connect(); }, 3000);
     }
 
     connect();
@@ -156,7 +98,7 @@ export default definePluginEntry({
     api.on("gateway_stop", () => {
       shuttingDown = true;
       if (reconnectTimer) clearTimeout(reconnectTimer);
-      if (ws) { intentionalClose = true; ws.close(1001, "shutdown"); }
+      if (ws) { intentionalClose = true; ws.close(1001); }
     });
   },
 });
