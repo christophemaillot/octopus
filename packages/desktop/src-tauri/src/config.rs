@@ -69,19 +69,20 @@ impl Default for OctopusConfig {
     }
 }
 
+/// Use $HOME/.config/octopus/ on all platforms
+pub fn config_dir() -> PathBuf {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE")) // Windows fallback
+        .unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home).join(".config").join("octopus")
+}
+
 pub fn config_path() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("octopus")
-        .join("octopus.toml")
+    config_dir().join("octopus.toml")
 }
 
 pub fn avatar_path(agent_id: &str) -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("octopus")
-        .join("avatars")
-        .join(format!("{}.png", agent_id))
+    config_dir().join("avatars").join(format!("{}.png", agent_id))
 }
 
 #[tauri::command]
@@ -110,10 +111,7 @@ pub fn avatar_exists(agent_id: String) -> bool {
 // ── Session persistence ─────────────────────────────────────────────────
 
 fn sessions_dir() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("octopus")
-        .join("sessions")
+    config_dir().join("sessions")
 }
 
 #[tauri::command]
