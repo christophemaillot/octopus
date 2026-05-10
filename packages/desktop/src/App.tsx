@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef } from "react";
+import { useState, useCallback, useRef, useEffect } from "react";
 import Sidebar from "./components/Sidebar";
 import Toolbar from "./components/Toolbar";
 import ThreadBar from "./components/ThreadBar";
@@ -129,6 +129,53 @@ export default function App() {
     },
     []
   );
+
+  // ── Keyboard shortcuts ───────────────────────────────────────────
+  const handleKeyDown = useCallback(
+    (e: KeyboardEvent) => {
+      const mod = e.metaKey || e.ctrlKey;
+      if (!mod) return;
+
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        const idx = agents.findIndex((a) => a.id === activeAgent);
+        if (idx > 0) setActiveAgent(agents[idx - 1].id);
+      }
+
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        const idx = agents.findIndex((a) => a.id === activeAgent);
+        if (idx < agents.length - 1) setActiveAgent(agents[idx + 1].id);
+      }
+
+      if (e.key === "ArrowLeft") {
+        e.preventDefault();
+        const list = threads[activeAgent ?? ""] ?? [];
+        if (list.length === 0) return;
+        const idx = list.findIndex((t) => t.id === activeThread);
+        if (idx > 0) setActiveThread(list[idx - 1].id);
+      }
+
+      if (e.key === "ArrowRight") {
+        e.preventDefault();
+        const list = threads[activeAgent ?? ""] ?? [];
+        if (list.length === 0) return;
+        const idx = list.findIndex((t) => t.id === activeThread);
+        if (idx < list.length - 1) setActiveThread(list[idx + 1].id);
+      }
+
+      if (e.key === "n") {
+        e.preventDefault();
+        if (activeAgent) createThread(activeAgent);
+      }
+    },
+    [agents, activeAgent, activeThread, threads, createThread],
+  );
+
+  useEffect(() => {
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [handleKeyDown]);
 
   // ── Split view: number of panes ────────────────────────────────────
   const [splitCount, setSplitCount] = useState(1);
