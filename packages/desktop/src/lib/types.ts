@@ -4,6 +4,14 @@ export interface AgentInfo {
   id: string;
   label: string;
   model: string;
+  models?: ModelInfo[];
+}
+
+export interface ModelInfo {
+  id: string;
+  label: string;
+  contextWindow?: number;
+  available?: boolean;
 }
 
 export interface HubMessage {

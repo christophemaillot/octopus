@@ -7,6 +7,7 @@ marked.use({ gfm: true, breaks: true });
 interface ChatPaneProps {
   thread: Thread | null;
   streamingContent: string | null;
+  isThinking: boolean;
   toolCalls: ToolCall[];
   onSend: (content: string, immediate?: boolean) => void;
   onCancel: () => void;
@@ -16,6 +17,7 @@ interface ChatPaneProps {
 export default function ChatPane({
   thread,
   streamingContent,
+  isThinking,
   toolCalls,
   onSend,
   onCancel,
@@ -28,7 +30,7 @@ export default function ChatPane({
   // Scroll on new content
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [thread?.messages, streamingContent, toolCalls]);
+  }, [thread?.messages, streamingContent, isThinking, toolCalls]);
 
   const handleSend = () => {
     const text = input.trim();
@@ -107,10 +109,17 @@ export default function ChatPane({
         ))}
 
         {/* Streaming content */}
+        {isThinking && !streamingContent && (
+          <div className="msg assistant typing-indicator" aria-label="L'agent écrit">
+            <span />
+            <span />
+            <span />
+          </div>
+        )}
+
         {streamingContent && (
           <div className="msg assistant">
             <FormattedMessage content={streamingContent} />
-            <span className="spinner" style={{ display: "inline-block", marginLeft: 4 }} />
           </div>
         )}
 
@@ -128,7 +137,7 @@ export default function ChatPane({
             placeholder="Tapez un message… (Entrée pour envoyer, Shift+Entrée pour sauter une ligne)"
             rows={1}
           />
-          {streamingContent ? (
+          {streamingContent || isThinking ? (
             <button onClick={onCancel} style={{ background: "var(--red)" }} title="Arrêter">
               ■
             </button>

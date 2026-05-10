@@ -38,9 +38,10 @@ export default function App() {
 
   // Streaming state
   const [streamingContent, setStreamingContent] = useState<string | null>(null);
+  const [isThinking, setIsThinking] = useState(false);
   const [toolCalls, setToolCalls] = useState<ToolCall[]>([]);
   const [contextPct, setContextPct] = useState(0);
-  const [model, setModel] = useState(DEFAULT_MODEL);
+  const [selectedModels, setSelectedModels] = useState<Record<string, string>>({});
 
   // Refs for stable streaming
   const curMsgId = useRef<string | null>(null);
@@ -71,8 +72,19 @@ export default function App() {
     agents.find((a) => a.id === activeAgent)?.label ??
     "";
 
+  const activeAgentInfo = agents.find((a) => a.id === activeAgent);
+  const configuredAgent = config?.agents.find((a) => a.id === activeAgent);
   const agentModel =
-    config?.agents.find((a) => a.id === activeAgent)?.model ?? model;
+    (activeAgent ? selectedModels[activeAgent] : undefined) ??
+    activeAgentInfo?.model ??
+    configuredAgent?.model ??
+    DEFAULT_MODEL;
+  const modelChoices = activeAgentInfo?.models ?? [];
+
+  const handleModelChange = useCallback((nextModel: string) => {
+    if (!activeAgent) return;
+    setSelectedModels((prev) => ({ ...prev, [activeAgent]: nextModel }));
+  }, [activeAgent]);
 
   const currentThreads = threads[activeAgent ?? ""] ?? [];
   const currentThread = currentThreads.find((t) => t.id === activeThread) ?? null;
@@ -115,6 +127,7 @@ export default function App() {
       curAgentRef.current = last.agentId;
       curThreadRef.current = last.threadId;
       setStreamingContent(null);
+      setIsThinking(false);
       setToolCalls([]);
       streamBufRef.current = "";
 
@@ -213,6 +226,7 @@ export default function App() {
       });
     }
     setStreamingContent(null);
+    setIsThinking(false);
     setToolCalls([]);
     streamBufRef.current = "";
   }, [activeAgent, activeThread, sendMessage]);
@@ -222,6 +236,7 @@ export default function App() {
     setActiveAgent(id);
     setActiveThread(null);
     setStreamingContent(null);
+    setIsThinking(false);
     setToolCalls([]);
   }, []);
 
@@ -277,10 +292,11 @@ export default function App() {
     switch (msg.type) {
       case "agent_status":
         if (msg.id && curMsgId.current === msg.id && msg.status === "thinking") {
-          setStreamingContent("…");
+          setIsThinking(true);
         }
         break;
       case "chunk":
+        setIsThinking(false);
         streamBufRef.current += msg.content ?? "";
         setStreamingContent(streamBufRef.current);
         break;
@@ -292,6 +308,7 @@ export default function App() {
 
           streamBufRef.current = "";
           setStreamingContent(null);
+          setIsThinking(false);
           setToolCalls([]);
           setContextPct(msg.usage?.context_pct ?? 0);
 
@@ -352,10 +369,11 @@ export default function App() {
       <div className="main">
         <Toolbar
           connected={connected}
-          model={model}
+          model={agentModel}
+          models={modelChoices}
           contextPct={contextPct}
           agentLabel={agentLabel}
-          onModelChange={setModel}
+          onModelChange={handleModelChange}
         />
 
         <ThreadBar
@@ -371,6 +389,7 @@ export default function App() {
               key={i}
               thread={currentThread}
               streamingContent={streamingContent}
+              isThinking={isThinking}
               toolCalls={toolCalls}
               onSend={handleSend}
               onCancel={handleCancel}

@@ -75,6 +75,18 @@ struct AgentInfo {
     id: String,
     label: String,
     model: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    models: Vec<ModelInfo>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct ModelInfo {
+    id: String,
+    label: String,
+    #[serde(default, rename = "contextWindow", skip_serializing_if = "Option::is_none")]
+    context_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    available: Option<bool>,
 }
 
 // ── Connection types ─────────────────────────────────────────────────────────
