@@ -194,12 +194,12 @@ async fn handle_connection(
     let provided_token = auth_message.token.as_deref().unwrap_or("");
     if let Some(expected) = &state.token {
         if provided_token != expected {
+            tracing::warn!("{addr} invalid token (provided len={}, expected len={})", provided_token.len(), expected.len());
             let _ = ws_writer
                 .send(Message::Text(
                     serde_json::json!({"type": "error", "code": "invalid_token", "message": "Invalid token"}).to_string(),
                 ))
                 .await;
-            tracing::warn!("{addr} invalid token");
             return;
         }
     }

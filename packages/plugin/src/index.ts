@@ -75,16 +75,28 @@ export default definePluginEntry({
     let ws: WebSocket | null = null;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
     let shuttingDown = false;
+    let connecting = false;
+    let intentionalClose = false;
 
     function connect() {
-      if (shuttingDown) return;
+      if (shuttingDown || connecting || (ws && ws.readyState === WebSocket.OPEN)) return;
 
+      connecting = true;
       api.logger.info(`octopus: connecting to hub...`);
+
+      // Close old socket if any
+      if (ws) {
+        intentionalClose = true;
+        try { ws.close(); } catch {}
+        intentionalClose = false;
+        ws = null;
+      }
 
       try {
         ws = new WebSocket(hubUrl);
 
         ws.on("open", () => {
+          connecting = false;
           api.logger.info("octopus: connected to hub");
 
           // Authenticate
@@ -110,6 +122,8 @@ export default definePluginEntry({
         });
 
         ws.on("close", (code: number, reason: Buffer) => {
+          connecting = false;
+          if (intentionalClose) return;
           api.logger.warn(
             `octopus: hub disconnected (code=${code}, reason=${reason.toString()})`,
           );
@@ -118,8 +132,9 @@ export default definePluginEntry({
         });
 
         ws.on("error", (err: Error) => {
+          connecting = false;
           api.logger.error(`octopus: hub websocket error: ${err.message}`);
-          ws?.close();
+          try { ws?.close(); } catch {}
           ws = null;
           scheduleReconnect();
         });
@@ -130,7 +145,7 @@ export default definePluginEntry({
     }
 
     function scheduleReconnect() {
-      if (shuttingDown || reconnectTimer) return;
+      if (shuttingDown || connecting || reconnectTimer) return;
       api.logger.info(`octopus: reconnecting in ${reconnectDelay}ms...`);
       reconnectTimer = setTimeout(() => {
         reconnectTimer = null;
