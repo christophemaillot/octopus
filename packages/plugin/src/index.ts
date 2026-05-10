@@ -16,6 +16,7 @@ import { createPluginRuntimeStore } from "openclaw/plugin-sdk/runtime-store";
 import type { PluginRuntime } from "openclaw/plugin-sdk/runtime-store";
 import WebSocket from "ws";
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -56,7 +57,13 @@ export default definePluginEntry({
       reconnectDelay?: number;
     };
 
-    const HUB_TOKEN = "2ae22ad5b40778fa3ddaa465fcf03380";
+    const HUB_TOKEN = (() => {
+      try {
+        return readFileSync("/etc/octopus/hub.token", "utf8").trim();
+      } catch {
+        return cfg.token || "2ae22ad5b40778fa3ddaa465fcf03380";
+      }
+    })();
     const hubUrl = cfg.hubUrl ?? "wss://octopus.chrm.fr:443";
     const authToken = cfg.token || HUB_TOKEN;
     const reconnectDelay = cfg.reconnectDelay ?? 5000;
