@@ -29,10 +29,8 @@ export default definePluginEntry({
 
     const hubUrl = "ws://127.0.0.1:3700";
     const authToken = cfg?.token || HUB_TOKEN;
+    api.logger.info("octopus: starting");
 
-    api.logger.info(`octopus: starting`);
-
-    // ── WebSocket state ──────────────────────────────────────────────
     let ws: WebSocket | null = null;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
     let shuttingDown = false;
@@ -55,80 +53,89 @@ export default definePluginEntry({
       connecting = true;
       if (ws) { intentionalClose = true; ws.terminate(); intentionalClose = false; ws = null; }
 
-      try {
-        ws = new WebSocket(hubUrl);
-        ws.onopen = () => {
-          connecting = false;
-          ws!.send(JSON.stringify({ type: "auth", role: "agent", token: authToken, agents: [{ id: "main", label: "Basile", model: api.runtime.agent.defaults.model }] }));
-        };
-        ws.onclose = () => { connecting = false; if (intentionalClose) return; ws = null; scheduleReconnect(); };
-        ws.onerror = () => { connecting = false; ws?.terminate(); ws = null; scheduleReconnect(); };
-      } catch { connecting = false; scheduleReconnect(); }
+      const newWs = new WebSocket(hubUrl);
+      ws = newWs;
+
+      newWs.onopen = () => {
+        if (newWs !== ws) return; // stale connection
+        connecting = false;
+        newWs.send(JSON.stringify({
+          type: "auth", role: "agent", token: authToken,
+          agents: [{ id: "main", label: "Basile", model: api.runtime.agent.defaults.model }],
+        }));
+      };
+
+      newWs.onclose = () => {
+        connecting = false;
+        if (intentionalClose || newWs !== ws) return;
+        ws = null;
+        scheduleReconnect();
+      };
+
+      newWs.onerror = () => {
+        connecting = false;
+        if (newWs !== ws) return;
+        newWs.terminate();
+        ws = null;
+        scheduleReconnect();
+      };
+
+      newWs.on("message", async (data: Buffer) => {
+        if (newWs !== ws) return;
+        let msg: any;
+        try { msg = JSON.parse(data.toString()); } catch { return; }
+        if (msg.type !== "send_message") return;
+
+        processing = true;
+        try {
+          const msgId = msg.id || randomUUID();
+          const agentId = msg.agent || "main";
+          const sessionId = `octopus:${agentId}:${msg.session || randomUUID()}`;
+
+          send({ type: "agent_status", agent: agentId, status: "thinking" });
+
+          const agentDir = api.runtime.agent.resolveAgentDir(api.config);
+          const result = await api.runtime.agent.runEmbeddedAgent({
+            sessionId,
+            runId: randomUUID(),
+            sessionFile: path.join(agentDir, "sessions", sessionId.replace(/:/g, "-") + ".jsonl"),
+            workspaceDir: api.runtime.agent.resolveAgentWorkspaceDir(api.config),
+            prompt: msg.content || "",
+            timeoutMs: api.runtime.agent.resolveAgentTimeoutMs(api.config),
+          });
+
+          send({
+            type: "done", id: msgId, agent: agentId,
+            content: result?.output || "",
+            usage: result?.usage, model: result?.model,
+          });
+        } catch (e: any) {
+          api.logger.error(`octopus: ${e.message}`);
+          send({ type: "error", code: "agent_error", message: e.message });
+        } finally {
+          processing = false;
+          if (ws?.readyState !== WebSocket.OPEN) scheduleReconnect();
+        }
+      });
     }
 
     connect();
 
-    // ── Message handler (async, sets processing=true) ──────────────
-    ws!.onmessage = async (raw) => {
-      let msg: any;
-      try { msg = JSON.parse(raw.toString()); } catch { return; }
-      if (msg.type !== "send_message") return;
-
-      processing = true;
-      const msgId = msg.id || randomUUID();
-      const agentId = msg.agent || "main";
-      const sessionId = `octopus:${agentId}:${msg.session || randomUUID()}`;
-
-      try {
-        send({ type: "agent_status", agent: agentId, status: "thinking" });
-
-        // Run a full embedded agent turn (same pipeline as Telegram)
-        const agentDir = api.runtime.agent.resolveAgentDir(api.config);
-        const result = await api.runtime.agent.runEmbeddedAgent({
-          sessionId,
-          runId: randomUUID(),
-          sessionFile: path.join(agentDir, "sessions", `${sessionId.replace(/:/g, "-")}.jsonl`),
-          workspaceDir: api.runtime.agent.resolveAgentWorkspaceDir(api.config),
-          prompt: msg.content || "",
-          timeoutMs: api.runtime.agent.resolveAgentTimeoutMs(api.config),
-        });
-
-        // Extract assistant response
-        const fullContent = result?.output || "";
-
-        send({ type: "done", id: msgId, agent: agentId, content: fullContent, usage: result?.usage, model: result?.model });
-      } catch (e: any) {
-        api.logger.error(`octopus: ${e.message}`);
-        send({ type: "error", code: "agent_error", message: e.message });
-      } finally {
-        processing = false;
-        if (ws?.readyState !== WebSocket.OPEN) scheduleReconnect();
-      }
-    };
-
-    // ── Hooks for streaming ─────────────────────────────────────────
     api.on("llm_output", async (event) => {
       if (!processing) return;
-      try {
-        send({ type: "chunk", content: (event.output as any)?.text || "" });
-      } catch {}
+      try { send({ type: "chunk", content: (event.output as any)?.text || "" }); } catch {}
     });
 
     api.on("before_tool_call", async (event) => {
       if (!processing) return;
-      try {
-        send({ type: "tool_progress", tool: event.toolName, status: "running" });
-      } catch {}
+      try { send({ type: "tool_progress", tool: event.toolName, status: "running" }); } catch {}
     });
 
     api.on("after_tool_call", async (event) => {
       if (!processing) return;
-      try {
-        send({ type: "tool_progress", tool: event.toolName, status: "completed" });
-      } catch {}
+      try { send({ type: "tool_progress", tool: event.toolName, status: "completed" }); } catch {}
     });
 
-    // ── Cleanup ─────────────────────────────────────────────────────
     api.on("gateway_stop", () => {
       shuttingDown = true;
       if (reconnectTimer) clearTimeout(reconnectTimer);
