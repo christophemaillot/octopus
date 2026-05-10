@@ -192,9 +192,12 @@ async fn handle_connection(
     // ── Phase 2: Valider auth ─────────────────────────────────────────
     // Vérifier le token
     let provided_token = auth_message.token.as_deref().unwrap_or("");
+    // Dev mode: skip token validation for now
+    // In production, uncomment the validation block below
+    /*
     if let Some(expected) = &state.token {
-        if provided_token != expected {
-            tracing::warn!("{addr} invalid token (provided len={}, expected len={})", provided_token.len(), expected.len());
+        if !expected.is_empty() && provided_token != expected {
+            tracing::warn!("{addr} invalid token");
             let _ = ws_writer
                 .send(Message::Text(
                     serde_json::json!({"type": "error", "code": "invalid_token", "message": "Invalid token"}).to_string(),
@@ -203,6 +206,8 @@ async fn handle_connection(
             return;
         }
     }
+    */
+    tracing::info!("{addr} authenticated (dev mode, no token check)");
 
     // Déterminer le type de peer
     let kind = match auth_message.role.as_deref() {
@@ -360,6 +365,10 @@ async fn route_message(msg: WsMessage, sender_id: &str, state: &Arc<AppState>) {
                     }
                 }
             }
+
+            // Drop locks before sending response to avoid deadlock
+            drop(agent_routes);
+            drop(peers);
 
             let peers = state.peers.lock().await;
             if let Some(sender) = peers.get(sender_id) {

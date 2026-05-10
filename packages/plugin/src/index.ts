@@ -213,12 +213,15 @@ async function handleHubMessage(
 
     try {
       // Run subagent to process the message
-      const { runId } = await api.runtime.subagent.run({
+      const subOptions: any = {
         sessionKey,
         message: msg.content ?? "",
-        model: msg.model,
         deliver: false,
-      });
+      };
+      if (msg.model) {
+        subOptions.model = msg.model;
+      }
+      const { runId } = await api.runtime.subagent.run(subOptions);
 
       const result = await api.runtime.subagent.waitForRun({
         runId,
