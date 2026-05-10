@@ -1,4 +1,3 @@
-import { useState } from "react";
 import type { Thread } from "../lib/types";
 
 interface ThreadBarProps {

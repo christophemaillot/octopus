@@ -22,29 +22,18 @@ export default function ChatPane({
   onInputChange,
 }: ChatPaneProps) {
   const [input, setInput] = useState("");
-  const [pendingCount, setPendingCount] = useState(0);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
-  const prevStreamingRef = useRef<string | null>(null);
 
   // Scroll on new content
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [thread?.messages, streamingContent, toolCalls]);
 
-  // Reset pending counter when stream ends
-  useEffect(() => {
-    if (!streamingContent && prevStreamingRef.current) {
-      setPendingCount(0);
-    }
-    prevStreamingRef.current = streamingContent;
-  }, [streamingContent]);
-
   const handleSend = () => {
     const text = input.trim();
     if (!text) return;
     setInput("");
-    setPendingCount((c) => c + 1);
     onSend(text);
   };
 
@@ -87,13 +76,16 @@ export default function ChatPane({
         )}
 
         {messages.map((msg) => (
-          <div key={msg.id}>
+          <div key={msg.id} className={`message-row ${msg.role}${msg.status === "pending" ? " pending" : ""}`}>
             {msg.toolCalls?.map((tc, i) => (
               <ToolCallBadge key={i} call={tc} />
             ))}
             {msg.content && (
-              <div className={`msg ${msg.role}`}>
+              <div className={`msg ${msg.role}${msg.status === "pending" ? " pending" : ""}`}>
                 <FormattedMessage content={msg.content} />
+                {msg.status === "pending" && (
+                  <div className="msg-pending-label">En attente d'envoi…</div>
+                )}
                 {msg.usage && (
                   <div className="msg-footer">
                     {msg.model && <span>{msg.model}</span>}
@@ -127,19 +119,6 @@ export default function ChatPane({
 
       {/* Input */}
       <div className="input-area" style={{ flexDirection: "column", gap: 4 }}>
-        {pendingCount > 0 && (
-          <div
-            style={{
-              fontSize: 11,
-              color: "var(--text-dim)",
-              textAlign: "center",
-            }}
-          >
-            {pendingCount > 1
-              ? `${pendingCount} messages en attente d'envoi`
-              : "Message mis en attente (appuyez sur Entrée à nouveau pour envoyer, ou attendez)"}
-          </div>
-        )}
         <div style={{ display: "flex", gap: 8 }}>
           <textarea
             ref={inputRef}

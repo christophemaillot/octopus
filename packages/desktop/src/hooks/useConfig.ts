@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import type { OctopusConfig, AgentConfig } from "../lib/config";
+import type { OctopusConfig } from "../lib/config";
 
 export interface ConfigState {
   config: OctopusConfig | null;

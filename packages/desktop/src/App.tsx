@@ -11,6 +11,14 @@ import type { Thread, Message, ToolCall } from "./lib/types";
 const DEFAULT_MODEL = "deepseek/deepseek-v4-flash";
 const SEND_DEBOUNCE_MS = 1500;
 
+interface PendingSend {
+  id: string;
+  agentId: string;
+  threadId: string;
+  content: string;
+  model: string;
+}
+
 export default function App() {
   const { config } = useConfig();
   const { connected, agents, agentStatuses, sendMessage, onMessage } = useHub(
@@ -42,9 +50,7 @@ export default function App() {
 
   // Send debounce refs
   const sendTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const pendingTextRef = useRef<string | null>(null);
-  const inputVersionRef = useRef(0);
-  const sendVersionRef = useRef(0);
+  const pendingQueueRef = useRef<PendingSend[]>([]);
 
   // Load persisted threads on mount
   useEffect(() => {
@@ -88,95 +94,112 @@ export default function App() {
     return thread;
   }, []);
 
-  // ── Actually send the message ────────────────────────────────────
-  const doSend = useCallback(
-    (content: string) => {
-      if (!activeAgent) return;
+  const flushPendingQueue = useCallback(() => {
+    if (sendTimerRef.current) clearTimeout(sendTimerRef.current);
+    sendTimerRef.current = null;
 
-      const agentId = activeAgent;
-      let thread = currentThread;
+    const pending = pendingQueueRef.current.splice(0);
+    if (pending.length === 0) return;
 
-      if (!thread) thread = createThread(agentId);
+    const groups = new Map<string, PendingSend[]>();
+    pending.forEach((item) => {
+      const key = `${item.agentId}\u0000${item.threadId}`;
+      groups.set(key, [...(groups.get(key) ?? []), item]);
+    });
 
-      const msgId = crypto.randomUUID();
-      curMsgId.current = msgId;
-      curAgentRef.current = agentId;
-      curThreadRef.current = thread.id;
+    for (const items of groups.values()) {
+      const last = items[items.length - 1];
+      const content = items.map((item) => item.content).join("\n\n");
 
-      const userMsg: Message = {
-        id: `user-${msgId}`,
-        role: "user",
-        content,
-        timestamp: Date.now(),
-      };
-
-      setThreads((prev) => ({
-        ...prev,
-        [agentId]: prev[agentId].map((t) =>
-          t.id === thread!.id
-            ? { ...t, messages: [...t.messages, userMsg], title: content.slice(0, 40) }
-            : t,
-        ),
-      }));
-
+      curMsgId.current = last.id;
+      curAgentRef.current = last.agentId;
+      curThreadRef.current = last.threadId;
       setStreamingContent(null);
       setToolCalls([]);
       streamBufRef.current = "";
 
+      setThreads((prev) => ({
+        ...prev,
+        [last.agentId]: (prev[last.agentId] ?? []).map((t) =>
+          t.id === last.threadId
+            ? {
+                ...t,
+                messages: t.messages.map((msg) =>
+                  items.some((item) => msg.id === `user-${item.id}`)
+                    ? { ...msg, status: "sent" }
+                    : msg,
+                ),
+              }
+            : t,
+        ),
+      }));
+
       sendMessage({
         type: "send_message",
-        id: msgId,
-        agent: agentId,
-        session: thread.id,
+        id: last.id,
+        agent: last.agentId,
+        session: last.threadId,
         content,
-        model: agentModel,
+        model: last.model,
       });
-    },
-    [activeAgent, currentThread, createThread, sendMessage, agentModel],
-  );
+    }
+  }, [sendMessage]);
 
   // ── Debounced send ──────────────────────────────────────────────
-  const queueSend = useCallback((text: string) => {
-    const version = ++sendVersionRef.current;
-    pendingTextRef.current = text;
+  const queueSend = useCallback((content: string) => {
+    if (!activeAgent) return;
+
+    const agentId = activeAgent;
+    const thread = currentThread ?? createThread(agentId);
+    const msgId = crypto.randomUUID();
+
+    const userMsg: Message = {
+      id: `user-${msgId}`,
+      role: "user",
+      content,
+      status: "pending",
+      timestamp: Date.now(),
+    };
+
+    pendingQueueRef.current.push({
+      id: msgId,
+      agentId,
+      threadId: thread.id,
+      content,
+      model: agentModel,
+    });
+
+    setThreads((prev) => ({
+      ...prev,
+      [agentId]: (() => {
+        const list = prev[agentId] ?? [];
+        if (list.some((t) => t.id === thread.id)) {
+          return list.map((t) =>
+            t.id === thread.id
+              ? { ...t, messages: [...t.messages, userMsg], title: content.slice(0, 40) }
+              : t,
+          );
+        }
+        return [{ ...thread, messages: [userMsg], title: content.slice(0, 40) }];
+      })(),
+    }));
 
     if (sendTimerRef.current) clearTimeout(sendTimerRef.current);
+    sendTimerRef.current = setTimeout(flushPendingQueue, SEND_DEBOUNCE_MS);
+  }, [activeAgent, currentThread, createThread, agentModel, flushPendingQueue]);
 
-    sendTimerRef.current = setTimeout(() => {
-      if (sendVersionRef.current === version) {
-        doSend(text);
-        pendingTextRef.current = null;
-        sendTimerRef.current = null;
-      }
-    }, SEND_DEBOUNCE_MS);
-  }, [doSend]);
-
-  // If the user keeps typing after pressing Enter, cancel the pending send
-  const notifyInputChange = useCallback(() => {
-    const v = ++inputVersionRef.current;
-    if (sendTimerRef.current && pendingTextRef.current) {
-      // Only cancel if the user actually typed more (not just cursor move)
-      // This is signaled by ChatPane calling this on input changes
-      if (v > sendVersionRef.current + 1) {
-        clearTimeout(sendTimerRef.current);
-        sendTimerRef.current = null;
-        pendingTextRef.current = null;
-      }
-    }
-  }, []);
+  const notifyInputChange = useCallback(() => {}, []);
 
   const handleSend = useCallback(
     (content: string, immediate = false) => {
       if (immediate) {
-        if (sendTimerRef.current) clearTimeout(sendTimerRef.current);
-        sendTimerRef.current = null;
-        pendingTextRef.current = null;
-        doSend(content);
+        queueSend(content);
+        setTimeout(flushPendingQueue, 0);
       } else {
         queueSend(content);
       }
     },
-    [doSend, queueSend],
+    [queueSend, flushPendingQueue],
   );
 
   // ── Cancel ──────────────────────────────────────────────────────
@@ -252,6 +275,11 @@ export default function App() {
   // ── Streaming responses ─────────────────────────────────────────
   const handleStreamMsg = useCallback((msg: any) => {
     switch (msg.type) {
+      case "agent_status":
+        if (msg.id && curMsgId.current === msg.id && msg.status === "thinking") {
+          setStreamingContent("…");
+        }
+        break;
       case "chunk":
         streamBufRef.current += msg.content ?? "";
         setStreamingContent(streamBufRef.current);

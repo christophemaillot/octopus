@@ -288,6 +288,16 @@ html, body, #root {
   gap: 12px;
 }
 
+.message-row {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.message-row.user { align-items: flex-end; }
+.message-row.assistant { align-items: flex-start; }
+.message-row.system { align-items: center; }
+
 .msg {
   max-width: 80%;
   padding: 10px 14px;
@@ -302,6 +312,12 @@ html, body, #root {
   background: var(--accent);
   color: white;
   border-bottom-right-radius: 4px;
+}
+
+.msg.user.pending {
+  opacity: 0.62;
+  border: 1px dashed rgba(255,255,255,0.45);
+  background: color-mix(in srgb, var(--accent) 70%, transparent);
 }
 
 .msg.assistant {
@@ -372,6 +388,13 @@ html, body, #root {
   margin-top: 6px;
   display: flex;
   gap: 12px;
+}
+
+.msg-pending-label {
+  font-size: 10px;
+  color: rgba(255,255,255,0.75);
+  margin-top: 4px;
+  font-style: italic;
 }
 
 /* ── Tool call ──────────────────────────────────── */

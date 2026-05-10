@@ -38,6 +38,7 @@ export interface Message {
   id: string;
   role: "user" | "assistant" | "system";
   content: string;
+  status?: "pending" | "sent";
   toolCalls?: ToolCall[];
   usage?: { input_tokens: number; output_tokens: number; context_pct: number };
   model?: string;

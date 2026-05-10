@@ -102,6 +102,8 @@ struct AppState {
     peers: Mutex<HashMap<String, Peer>>,
     /// Index: agent_id → peer_id (pour routage rapide)
     agent_routes: Mutex<HashMap<String, String>>,
+    /// Index: message_id → client peer_id (pour éviter de broadcaster une réponse à tous les clients)
+    pending_requests: Mutex<HashMap<String, String>>,
     token: Option<String>,
 }
 
@@ -119,6 +121,7 @@ async fn main() -> anyhow::Result<()> {
     let state = Arc::new(AppState {
         peers: Mutex::new(HashMap::new()),
         agent_routes: Mutex::new(HashMap::new()),
+        pending_requests: Mutex::new(HashMap::new()),
         token: args.token,
     });
 
@@ -315,6 +318,11 @@ async fn route_message(msg: WsMessage, sender_id: &str, state: &Arc<AppState>) {
         // Un client envoie un message vers un agent
         "send_message" => {
             let agent_id = msg.agent.as_deref().unwrap_or("main");
+            if let Some(message_id) = &msg.id {
+                let mut pending = state.pending_requests.lock().await;
+                pending.insert(message_id.clone(), sender_id.to_string());
+            }
+
             let agent_routes = state.agent_routes.lock().await;
 
             if let Some(peer_id) = agent_routes.get(agent_id) {
@@ -338,9 +346,33 @@ async fn route_message(msg: WsMessage, sender_id: &str, state: &Arc<AppState>) {
             }
         }
 
-        // Une réponse d'agent → broadcast à tous les clients
+        // Une réponse d'agent → client qui a émis la requête si l'id est connu,
+        // fallback broadcast pour les messages globaux sans id.
         "chunk" | "done" | "tool_progress" | "agent_status" | "error" | "pong" => {
+            let target_peer_id = if let Some(message_id) = &msg.id {
+                let pending = state.pending_requests.lock().await;
+                pending.get(message_id).cloned()
+            } else {
+                None
+            };
+
             let peers = state.peers.lock().await;
+            if let Some(peer_id) = target_peer_id {
+                if let Some(peer) = peers.get(&peer_id) {
+                    let _ = peer.tx.send(Message::Text(
+                        serde_json::to_string(&msg).unwrap(),
+                    ));
+                }
+                drop(peers);
+                if matches!(msg.msg_type.as_str(), "done" | "error") {
+                    if let Some(message_id) = &msg.id {
+                        let mut pending = state.pending_requests.lock().await;
+                        pending.remove(message_id);
+                    }
+                }
+                return;
+            }
+
             for (peer_id, peer) in peers.iter() {
                 // Ne pas renvoyer à l'émetteur (agent)
                 if peer_id == sender_id {
