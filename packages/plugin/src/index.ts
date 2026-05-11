@@ -183,6 +183,8 @@ export default definePluginEntry({
     let currentMsgId: string | null = null;
     let currentAgentId: string | null = null;
     let currentSession: string | null = null;
+    let currentRunId: string | null = null;
+    let currentStreamText = "";
 
     function send(msg: Record<string, unknown>) {
       if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
@@ -249,9 +251,12 @@ export default definePluginEntry({
           const selectedModel = splitModelId(String(msg.model || agent.model));
           const sessionId = `octopus:${agentId}:${msg.session || randomUUID()}`;
           const clientSession = String(msg.session || sessionId);
+          const runId = randomUUID();
           currentMsgId = msgId;
           currentAgentId = agentId;
           currentSession = clientSession;
+          currentRunId = runId;
+          currentStreamText = "";
 
           send({
             type: "agent_status",
@@ -267,7 +272,7 @@ export default definePluginEntry({
           const result = await api.runtime.agent.runEmbeddedAgent({
             sessionId,
             agentId,
-            runId: randomUUID(),
+            runId,
             sessionFile: path.join(sessionsDir, sessionId.replace(/:/g, "-") + ".jsonl"),
             workspaceDir: agent.workspaceDir,
             agentDir: agent.agentDir,
@@ -291,6 +296,8 @@ export default definePluginEntry({
           currentMsgId = null;
           currentAgentId = null;
           currentSession = null;
+          currentRunId = null;
+          currentStreamText = "";
           if (ws?.readyState !== WebSocket.OPEN) scheduleReconnect();
         }
       });
@@ -300,17 +307,50 @@ export default definePluginEntry({
 
     api.on("llm_output", async (event) => {
       if (!processing) return;
-      try { send({ type: "chunk", id: currentMsgId, agent: currentAgentId, session: currentSession, content: (event.output as any)?.text || "" }); } catch {}
+      if (currentRunId && event.runId && event.runId !== currentRunId) return;
+      try {
+        const fullText = Array.isArray((event as any).assistantTexts)
+          ? (event as any).assistantTexts.filter(Boolean).join("\n\n")
+          : "";
+        if (!fullText || fullText === currentStreamText) return;
+        const content = fullText.startsWith(currentStreamText)
+          ? fullText.slice(currentStreamText.length)
+          : fullText;
+        currentStreamText = fullText;
+        send({ type: "chunk", id: currentMsgId, agent: currentAgentId, session: currentSession, content });
+      } catch {}
     });
 
     api.on("before_tool_call", async (event) => {
       if (!processing) return;
-      try { send({ type: "tool_progress", id: currentMsgId, agent: currentAgentId, session: currentSession, tool: event.toolName, status: "running" }); } catch {}
+      if (currentRunId && event.runId && event.runId !== currentRunId) return;
+      try {
+        send({
+          type: "tool_progress",
+          id: currentMsgId,
+          agent: currentAgentId,
+          session: currentSession,
+          tool: event.toolName,
+          status: "running",
+          summary: event.toolCallId,
+        });
+      } catch {}
     });
 
     api.on("after_tool_call", async (event) => {
       if (!processing) return;
-      try { send({ type: "tool_progress", id: currentMsgId, agent: currentAgentId, session: currentSession, tool: event.toolName, status: "completed" }); } catch {}
+      if (currentRunId && event.runId && event.runId !== currentRunId) return;
+      try {
+        send({
+          type: "tool_progress",
+          id: currentMsgId,
+          agent: currentAgentId,
+          session: currentSession,
+          tool: event.toolName,
+          status: event.error ? "error" : "completed",
+          summary: event.error || (typeof event.durationMs === "number" ? `${event.durationMs}ms` : event.toolCallId),
+        });
+      } catch {}
     });
 
     api.on("gateway_stop", () => {
