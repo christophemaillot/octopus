@@ -160,6 +160,14 @@ function canvasPath(pathname: string): string {
   return "/__openclaw__/canvas/";
 }
 
+function gatewayAuthHeaders(config: any): Record<string, string> {
+  const token = config?.gateway?.auth?.token;
+  if (typeof token === "string" && token) return { Authorization: `Bearer ${token}` };
+  const password = config?.gateway?.auth?.password;
+  if (typeof password === "string" && password) return { "x-openclaw-password": password };
+  return {};
+}
+
 export default definePluginEntry({
   id: "octopus",
   name: "Octopus",
@@ -250,7 +258,10 @@ export default definePluginEntry({
         if (msg.type === "canvas_http_request") {
           try {
             const url = new URL(canvasPath(String(msg.path || "")), "http://127.0.0.1:18789");
-            const resp = await fetch(url, { method: String(msg.method || "GET") });
+            const resp = await fetch(url, {
+              method: String(msg.method || "GET"),
+              headers: gatewayAuthHeaders(api.config),
+            });
             const body = Buffer.from(await resp.arrayBuffer()).toString("base64");
             send({
               type: "canvas_http_response",
