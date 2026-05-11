@@ -13,14 +13,17 @@
 
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::time::{timeout, Duration};
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -84,6 +87,20 @@ struct WsMessage {
     ack_seq: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sessions: Option<Vec<ReplaySession>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    method: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
+    #[serde(default, rename = "statusCode", skip_serializing_if = "Option::is_none")]
+    status_code: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    headers: Option<serde_json::Value>,
+    #[serde(default, rename = "bodyBase64", skip_serializing_if = "Option::is_none")]
+    body_base64: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -153,6 +170,7 @@ struct AppState {
     agent_routes: Mutex<HashMap<String, String>>,
     /// Index: message_id → client peer_id (pour éviter de broadcaster une réponse à tous les clients)
     pending_requests: Mutex<HashMap<String, String>>,
+    pending_canvas: Mutex<HashMap<String, oneshot::Sender<WsMessage>>>,
     events: Mutex<Vec<PersistedEvent>>,
     next_seq: Mutex<u64>,
     event_log_path: PathBuf,
@@ -188,6 +206,7 @@ async fn main() -> anyhow::Result<()> {
         peers: Mutex::new(HashMap::new()),
         agent_routes: Mutex::new(HashMap::new()),
         pending_requests: Mutex::new(HashMap::new()),
+        pending_canvas: Mutex::new(HashMap::new()),
         events: Mutex::new(events),
         next_seq: Mutex::new(next_seq),
         event_log_path,
@@ -210,6 +229,11 @@ async fn main() -> anyhow::Result<()> {
 // ── Connection handler ────────────────────────────────────────────────────────
 
 async fn handle_connection(stream: TcpStream, addr: std::net::SocketAddr, state: Arc<AppState>) {
+    if is_plain_http(&stream).await {
+        handle_http_connection(stream, addr, state).await;
+        return;
+    }
+
     let ws_stream = match accept_async(stream).await {
         Ok(ws) => ws,
         Err(e) => {
@@ -445,6 +469,27 @@ async fn route_message(msg: WsMessage, sender_id: &str, state: &Arc<AppState>) {
 
         // Une réponse d'agent → client qui a émis la requête si l'id est connu,
         // fallback broadcast pour les messages globaux sans id.
+        "canvas_http_response" => {
+            if let Some(request_id) = &msg.id {
+                let tx = state.pending_canvas.lock().await.remove(request_id);
+                if let Some(tx) = tx {
+                    let _ = tx.send(msg);
+                }
+            }
+        }
+
+        "canvas_open" => {
+            let peers = state.peers.lock().await;
+            for (peer_id, peer) in peers.iter() {
+                if peer_id == sender_id || peer.kind == PeerKind::Agent {
+                    continue;
+                }
+                let _ = peer
+                    .tx
+                    .send(Message::Text(serde_json::to_string(&msg).unwrap()));
+            }
+        }
+
         "chunk" | "done" | "tool_progress" | "agent_status" | "error" | "pong" => {
             if matches!(
                 msg.msg_type.as_str(),
@@ -598,6 +643,180 @@ async fn cleanup_peer(peer_id: &str, hosted_agents: &[String], state: &Arc<AppSt
 
     let mut peers = state.peers.lock().await;
     peers.remove(peer_id);
+}
+
+// ── Minimal HTTP surface ─────────────────────────────────────────────────────
+
+async fn is_plain_http(stream: &TcpStream) -> bool {
+    let mut buf = [0u8; 1024];
+    let Ok(Ok(n)) = timeout(Duration::from_millis(500), stream.peek(&mut buf)).await else {
+        return false;
+    };
+    if n == 0 {
+        return false;
+    }
+    let head = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+    !head.contains("upgrade: websocket")
+        && (head.starts_with("get ")
+            || head.starts_with("head ")
+            || head.starts_with("post ")
+            || head.starts_with("options "))
+}
+
+async fn handle_http_connection(mut stream: TcpStream, addr: std::net::SocketAddr, state: Arc<AppState>) {
+    let mut buf = Vec::with_capacity(4096);
+    let mut tmp = [0u8; 1024];
+    while !buf.windows(4).any(|w| w == b"\r\n\r\n") && buf.len() < 16 * 1024 {
+        match stream.read(&mut tmp).await {
+            Ok(0) => return,
+            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+            Err(_) => return,
+        }
+    }
+
+    let req = String::from_utf8_lossy(&buf);
+    let mut lines = req.lines();
+    let Some(first) = lines.next() else { return; };
+    let parts: Vec<&str> = first.split_whitespace().collect();
+    if parts.len() < 2 {
+        let _ = write_http_response(&mut stream, 400, &[("content-type", "text/plain")], b"bad request").await;
+        return;
+    }
+
+    let method = parts[0].to_ascii_uppercase();
+    let target = parts[1];
+    tracing::debug!("http {addr} {method} {target}");
+
+    if method == "OPTIONS" {
+        let _ = write_http_response(&mut stream, 204, &[("access-control-allow-origin", "*")], b"").await;
+        return;
+    }
+
+    if target == "/" {
+        let agent_routes = state.agent_routes.lock().await;
+        let body = serde_json::json!({"status":"ok","version":env!("CARGO_PKG_VERSION"),"agents":agent_routes.keys().collect::<Vec<_>>()}).to_string();
+        let _ = write_http_response(&mut stream, 200, &[("content-type", "application/json")], body.as_bytes()).await;
+        return;
+    }
+
+    if let Some(rest) = target.strip_prefix("/canvas/") {
+        let (agent, tail) = rest.split_once('/').unwrap_or((rest, ""));
+        if agent.is_empty() {
+            let _ = write_http_response(&mut stream, 404, &[("content-type", "text/plain")], b"missing agent").await;
+            return;
+        }
+        if !rest.contains('/') && !target.contains('?') {
+            let location = format!("/canvas/{agent}/");
+            let _ = write_http_response(&mut stream, 302, &[("location", &location)], b"").await;
+            return;
+        }
+
+        let canvas_path = format!("/__openclaw__/canvas/{tail}");
+        match proxy_canvas_request(agent, &method, &canvas_path, state.clone()).await {
+            Ok(mut resp) => {
+                let mut body = resp.body_base64.as_deref()
+                    .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
+                    .unwrap_or_default();
+                let headers_json = resp.headers.take().unwrap_or_else(|| serde_json::json!({}));
+                let content_type = headers_json.get("content-type").and_then(|v| v.as_str()).unwrap_or("application/octet-stream");
+
+                if content_type.contains("text/html") {
+                    if let Ok(mut html) = String::from_utf8(body.clone()) {
+                        let base = format!("/canvas/{agent}/");
+                        html = html.replace("/__openclaw__/canvas/", &base);
+                        if !html.contains("<base ") {
+                            html = html.replace("<head>", &format!("<head><base href=\"{base}\">"));
+                        }
+                        body = html.into_bytes();
+                    }
+                }
+
+                let status = resp.status_code.unwrap_or(502);
+                let _ = write_http_response(
+                    &mut stream,
+                    status,
+                    &[("content-type", content_type), ("cache-control", "no-store")],
+                    if method == "HEAD" { b"" } else { &body },
+                ).await;
+            }
+            Err(err) => {
+                tracing::warn!("canvas proxy failed for {agent}: {err}");
+                let _ = write_http_response(&mut stream, 502, &[("content-type", "text/plain")], err.to_string().as_bytes()).await;
+            }
+        }
+        return;
+    }
+
+    let _ = write_http_response(&mut stream, 404, &[("content-type", "text/plain")], b"not found").await;
+}
+
+async fn proxy_canvas_request(agent: &str, method: &str, path: &str, state: Arc<AppState>) -> anyhow::Result<WsMessage> {
+    let peer_id = {
+        let routes = state.agent_routes.lock().await;
+        routes.get(agent).cloned()
+    }.ok_or_else(|| anyhow::anyhow!("agent '{agent}' is not connected"))?;
+
+    let request_id = format!("canvas-{:x}", fast_rand());
+    let (tx, rx) = oneshot::channel();
+    state.pending_canvas.lock().await.insert(request_id.clone(), tx);
+
+    let req = WsMessage {
+        msg_type: "canvas_http_request".to_string(),
+        id: Some(request_id.clone()),
+        agent: Some(agent.to_string()),
+        method: Some(method.to_string()),
+        path: Some(path.to_string()),
+        ..empty_message()
+    };
+
+    let sent = {
+        let peers = state.peers.lock().await;
+        peers.get(&peer_id)
+            .map(|peer| peer.tx.send(Message::Text(serde_json::to_string(&req).unwrap())).is_ok())
+            .unwrap_or(false)
+    };
+
+    if !sent {
+        state.pending_canvas.lock().await.remove(&request_id);
+        anyhow::bail!("agent '{agent}' route is unavailable");
+    }
+
+    match timeout(Duration::from_secs(20), rx).await {
+        Ok(Ok(resp)) => Ok(resp),
+        Ok(Err(_)) => anyhow::bail!("canvas response channel closed"),
+        Err(_) => {
+            state.pending_canvas.lock().await.remove(&request_id);
+            anyhow::bail!("canvas request timed out")
+        }
+    }
+}
+
+fn empty_message() -> WsMessage {
+    WsMessage {
+        msg_type: String::new(), id: None, role: None, agent: None, agents: None,
+        session: None, content: None, model: None, token: None, status: None, tool: None,
+        summary: None, code: None, message: None, usage: None, seq: None, since: None,
+        ack_seq: None, sessions: None, method: None, path: None, title: None, url: None,
+        status_code: None, headers: None, body_base64: None,
+    }
+}
+
+async fn write_http_response(stream: &mut TcpStream, status: u16, headers: &[(&str, &str)], body: &[u8]) -> std::io::Result<()> {
+    let reason = match status {
+        200 => "OK", 204 => "No Content", 302 => "Found", 400 => "Bad Request",
+        404 => "Not Found", 502 => "Bad Gateway", _ => "OK",
+    };
+    let mut head = format!("HTTP/1.1 {status} {reason}\r\ncontent-length: {}\r\n", body.len());
+    for (name, value) in headers {
+        head.push_str(name);
+        head.push_str(": ");
+        head.push_str(value);
+        head.push_str("\r\n");
+    }
+    head.push_str("connection: close\r\n\r\n");
+    stream.write_all(head.as_bytes()).await?;
+    stream.write_all(body).await?;
+    stream.shutdown().await
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

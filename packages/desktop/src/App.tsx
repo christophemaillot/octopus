@@ -20,6 +20,25 @@ interface PendingSend {
   model: string;
 }
 
+interface CanvasPanelState {
+  agentId: string;
+  title: string;
+  url: string;
+}
+
+function hubHttpBase(wsUrl: string): string {
+  try {
+    const url = new URL(wsUrl || "wss://octopus.chrm.fr");
+    url.protocol = url.protocol === "wss:" ? "https:" : "http:";
+    url.pathname = "";
+    url.search = "";
+    url.hash = "";
+    return url.toString().replace(/\/$/, "");
+  } catch {
+    return "https://octopus.chrm.fr";
+  }
+}
+
 export default function App() {
   const { config } = useConfig();
   const { connected, agents, agentStatuses, sendMessage, onMessage } = useHub(
@@ -48,6 +67,7 @@ export default function App() {
   const [pendingCount, setPendingCount] = useState(0);
   const [activeTool, setActiveTool] = useState<string | null>(null);
   const [actualModels, setActualModels] = useState<Record<string, string>>({});
+  const [canvasPanel, setCanvasPanel] = useState<CanvasPanelState | null>(null);
 
   // Refs for stable streaming
   const curMsgId = useRef<string | null>(null);
@@ -98,6 +118,16 @@ export default function App() {
     if (!activeAgent) return;
     setSelectedModels((prev) => ({ ...prev, [activeAgent]: nextModel }));
   }, [activeAgent]);
+
+  const openCanvas = useCallback((agentId = activeAgent ?? "main", title?: string, url?: string) => {
+    const path = url || `/canvas/${agentId}/`;
+    const absoluteUrl = path.startsWith("http") ? path : `${hubHttpBase(config?.hub?.url ?? "wss://octopus.chrm.fr")}${path}`;
+    setCanvasPanel({
+      agentId,
+      title: title || `${agentId} Canvas`,
+      url: absoluteUrl,
+    });
+  }, [activeAgent, config?.hub?.url]);
 
   const currentThreads = threads[activeAgent ?? ""] ?? [];
   const currentThread = currentThreads.find((t) => t.id === activeThread) ?? null;
@@ -519,6 +549,11 @@ export default function App() {
         });
         break;
       }
+      case "canvas_open": {
+        const agentId = msg.agent ?? activeAgent ?? "main";
+        openCanvas(agentId, msg.title ?? "Canvas", msg.url ?? `/canvas/${agentId}/`);
+        break;
+      }
       case "agent_status":
         if (msg.id && curMsgId.current === msg.id && msg.status === "thinking") {
           setIsThinking(true);
@@ -629,7 +664,7 @@ export default function App() {
         });
         break;
     }
-  }, [ackSeq, activeAgent, activeThread]);
+  }, [ackSeq, activeAgent, activeThread, openCanvas]);
 
   useEffect(() => {
     const unsub = onMessage(handleStreamMsg);
@@ -667,6 +702,7 @@ export default function App() {
           actualModel={actualModel}
           onModelChange={handleModelChange}
           onSendModeChange={setSendMode}
+          onOpenCanvas={() => activeAgent && openCanvas(activeAgent)}
         />
 
         <ThreadBar
@@ -694,6 +730,19 @@ export default function App() {
           ))}
         </div>
       </div>
+
+      {canvasPanel && (
+        <aside className="canvas-panel">
+          <div className="canvas-panel-header">
+            <div>
+              <strong>{canvasPanel.title}</strong>
+              <span>{canvasPanel.agentId}</span>
+            </div>
+            <button onClick={() => setCanvasPanel(null)} title="Fermer le Canvas">×</button>
+          </div>
+          <iframe title={canvasPanel.title} src={canvasPanel.url} sandbox="allow-scripts allow-forms allow-popups allow-modals" />
+        </aside>
+      )}
     </div>
   );
 }

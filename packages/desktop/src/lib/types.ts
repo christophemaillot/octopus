@@ -37,6 +37,13 @@ export interface HubMessage {
   peer_id?: string;
   kind?: string;
   role?: string;
+  title?: string;
+  url?: string;
+  path?: string;
+  method?: string;
+  statusCode?: number;
+  headers?: Record<string, string>;
+  bodyBase64?: string;
 }
 
 export interface ReplaySession {

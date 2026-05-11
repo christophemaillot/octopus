@@ -154,6 +154,12 @@ function resultUsage(result: any): {
   };
 }
 
+function canvasPath(pathname: string): string {
+  const path = pathname || "/__openclaw__/canvas/";
+  if (path.startsWith("/__openclaw__/canvas/") || path.startsWith("/__openclaw__/a2ui/")) return path;
+  return "/__openclaw__/canvas/";
+}
+
 export default definePluginEntry({
   id: "octopus",
   name: "Octopus",
@@ -240,6 +246,36 @@ export default definePluginEntry({
         if (newWs !== ws) return;
         let msg: any;
         try { msg = JSON.parse(data.toString()); } catch { return; }
+
+        if (msg.type === "canvas_http_request") {
+          try {
+            const url = new URL(canvasPath(String(msg.path || "")), "http://127.0.0.1:18789");
+            const resp = await fetch(url, { method: String(msg.method || "GET") });
+            const body = Buffer.from(await resp.arrayBuffer()).toString("base64");
+            send({
+              type: "canvas_http_response",
+              id: msg.id,
+              agent: msg.agent,
+              statusCode: resp.status,
+              headers: {
+                "content-type": resp.headers.get("content-type") || "application/octet-stream",
+                "cache-control": resp.headers.get("cache-control") || "no-store",
+              },
+              bodyBase64: body,
+            });
+          } catch (e: any) {
+            send({
+              type: "canvas_http_response",
+              id: msg.id,
+              agent: msg.agent,
+              statusCode: 502,
+              headers: { "content-type": "text/plain" },
+              bodyBase64: Buffer.from(e?.message || String(e)).toString("base64"),
+            });
+          }
+          return;
+        }
+
         if (msg.type !== "send_message") return;
 
         processing = true;
@@ -325,6 +361,15 @@ export default definePluginEntry({
       if (!processing) return;
       if (currentRunId && event.runId && event.runId !== currentRunId) return;
       try {
+        if (!event.error && String(event.toolName || "").startsWith("canvas")) {
+          send({
+            type: "canvas_open",
+            agent: currentAgentId,
+            session: currentSession,
+            title: "Canvas",
+            url: currentAgentId ? `/canvas/${currentAgentId}/` : "/canvas/main/",
+          });
+        }
         send({
           type: "tool_progress",
           id: currentMsgId,

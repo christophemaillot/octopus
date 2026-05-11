@@ -15,6 +15,7 @@ interface ToolbarProps {
   actualModel?: string;
   onModelChange: (model: string) => void;
   onSendModeChange: (mode: SendMode) => void;
+  onOpenCanvas: () => void;
 }
 
 const FALLBACK_MODELS: ModelInfo[] = [
@@ -39,6 +40,7 @@ export default function Toolbar({
   actualModel,
   onModelChange,
   onSendModeChange,
+  onOpenCanvas,
 }: ToolbarProps) {
   const ctxClass = contextPct < 50 ? "low" : contextPct < 80 ? "med" : "high";
   const choices = models.length > 0 ? models : FALLBACK_MODELS;
@@ -75,6 +77,10 @@ export default function Toolbar({
           <option value="instant">instant</option>
         </select>
       </div>
+
+      <button className="toolbar-button" onClick={onOpenCanvas} disabled={!agentAvailable} title="Ouvrir le Canvas OpenClaw">
+        Canvas
+      </button>
 
       <div className="toolbar-model">
         <select value={model} onChange={(e) => onModelChange(e.target.value)}>
