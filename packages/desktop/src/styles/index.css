@@ -195,18 +195,21 @@ html, body, #root {
   cursor: pointer;
 }
 
-.toolbar-button {
+.toolbar-icon-button {
   background: var(--bg);
   color: var(--text);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  padding: 5px 10px;
-  font-size: 12px;
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  font-size: 15px;
   cursor: pointer;
 }
 
-.toolbar-button:hover:not(:disabled) { border-color: var(--accent-dim); }
-.toolbar-button:disabled { opacity: 0.45; cursor: not-allowed; }
+.toolbar-icon-button:hover:not(:disabled) { border-color: var(--accent-dim); color: var(--text-bright); }
+.toolbar-icon-button:disabled { opacity: 0.45; cursor: not-allowed; }
 
 .agent-availability,
 .run-pill,
@@ -227,31 +230,36 @@ html, body, #root {
 .run-pill.tool { color: var(--yellow); border-color: rgba(255, 193, 7, 0.45); animation: pulse 1.5s infinite; }
 .run-pill.error { color: var(--red); border-color: rgba(244, 67, 54, 0.45); }
 
-.context-bar {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 12px;
+.context-gauge { display: flex; align-items: center; }
+
+.context-gauge-ring {
+  --gauge-color: var(--green);
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  background: conic-gradient(var(--gauge-color) calc(var(--pct) * 1%), var(--bg) 0);
+  position: relative;
+}
+
+.context-gauge-ring::before {
+  content: "";
+  position: absolute;
+  inset: 4px;
+  border-radius: 50%;
+  background: var(--bg-sidebar);
+}
+
+.context-gauge-ring span {
+  position: relative;
+  font-size: 10px;
   color: var(--text-dim);
 }
 
-.context-fill {
-  width: 80px;
-  height: 6px;
-  background: var(--bg);
-  border-radius: 3px;
-  overflow: hidden;
-}
-
-.context-fill-inner {
-  height: 100%;
-  border-radius: 3px;
-  transition: width 0.3s, background 0.3s;
-}
-
-.context-fill-inner.low { background: var(--green); }
-.context-fill-inner.med { background: var(--yellow); }
-.context-fill-inner.high { background: var(--red); }
+.context-gauge-ring.low { --gauge-color: var(--green); }
+.context-gauge-ring.med { --gauge-color: var(--yellow); }
+.context-gauge-ring.high { --gauge-color: var(--red); }
 
 .connection-dot {
   width: 8px;
@@ -293,13 +301,26 @@ html, body, #root {
 /* ── Canvas panel ───────────────────────────────── */
 
 .canvas-panel {
-  width: min(46vw, 720px);
   min-width: 360px;
+  max-width: 72vw;
   border-left: 1px solid var(--border);
   background: var(--bg);
   display: flex;
   flex-direction: column;
+  position: relative;
 }
+
+.canvas-resize-handle {
+  position: absolute;
+  left: -4px;
+  top: 0;
+  bottom: 0;
+  width: 8px;
+  cursor: col-resize;
+  z-index: 2;
+}
+
+.canvas-resize-handle:hover { background: rgba(79, 140, 255, 0.22); }
 
 .canvas-panel-header {
   height: 42px;

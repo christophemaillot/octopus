@@ -75,6 +75,7 @@ export default function App() {
   const [activeTool, setActiveTool] = useState<string | null>(null);
   const [actualModels, setActualModels] = useState<Record<string, string>>({});
   const [canvasPanel, setCanvasPanel] = useState<CanvasPanelState | null>(null);
+  const [canvasWidth, setCanvasWidth] = useState(560);
   const [gatewayNotice, setGatewayNotice] = useState<GatewayNotice | null>(null);
 
   // Refs for stable streaming
@@ -94,6 +95,7 @@ export default function App() {
   const previousConnectedRef = useRef<boolean | null>(null);
   const previousAgentIdsRef = useRef<Set<string>>(new Set());
   const noticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastThreadByAgentRef = useRef<Record<string, string | null>>({});
 
   const showGatewayNotice = useCallback((notice: Omit<GatewayNotice, "id">) => {
     if (noticeTimerRef.current) clearTimeout(noticeTimerRef.current);
@@ -361,15 +363,22 @@ export default function App() {
 
   // ── Select agent ─────────────────────────────────────────────────
   const handleSelectAgent = useCallback((id: string) => {
+    if (activeAgent) lastThreadByAgentRef.current[activeAgent] = activeThread;
+    const list = threads[id] ?? [];
+    const preferred = lastThreadByAgentRef.current[id];
+    const nextThread = preferred && list.some((t) => t.id === preferred)
+      ? preferred
+      : (list[list.length - 1]?.id ?? null);
+
     setActiveAgent(id);
-    setActiveThread(null);
+    setActiveThread(nextThread);
     setStreamingContent(null);
     setIsThinking(false);
     setToolCalls([]);
     toolCallsRef.current = [];
     setActiveTool(null);
     setRunState("idle");
-  }, []);
+  }, [activeAgent, activeThread, threads]);
 
   // ── Close thread ─────────────────────────────────────────────────
   const closeThread = useCallback((threadId: string) => {
@@ -449,19 +458,23 @@ export default function App() {
       const mod = e.metaKey || e.ctrlKey;
       if (!mod) return;
 
-      if (e.key === "ArrowUp") {
+      const target = e.target as HTMLElement | null;
+      const isEditing = target?.tagName === "TEXTAREA" || target?.tagName === "INPUT" || target?.isContentEditable;
+      const navMod = mod && e.altKey && !isEditing;
+
+      if (navMod && e.key === "ArrowUp") {
         e.preventDefault();
         const idx = agents.findIndex((a) => a.id === activeAgent);
-        if (idx > 0) setActiveAgent(agents[idx - 1].id);
+        if (idx > 0) handleSelectAgent(agents[idx - 1].id);
       }
 
-      if (e.key === "ArrowDown") {
+      if (navMod && e.key === "ArrowDown") {
         e.preventDefault();
         const idx = agents.findIndex((a) => a.id === activeAgent);
-        if (idx < agents.length - 1) setActiveAgent(agents[idx + 1].id);
+        if (idx < agents.length - 1) handleSelectAgent(agents[idx + 1].id);
       }
 
-      if (e.key === "ArrowLeft") {
+      if (navMod && e.key === "ArrowLeft") {
         e.preventDefault();
         const list = threads[activeAgent ?? ""] ?? [];
         if (list.length === 0) return;
@@ -469,7 +482,7 @@ export default function App() {
         if (idx > 0) setActiveThread(list[idx - 1].id);
       }
 
-      if (e.key === "ArrowRight") {
+      if (navMod && e.key === "ArrowRight") {
         e.preventDefault();
         const list = threads[activeAgent ?? ""] ?? [];
         if (list.length === 0) return;
@@ -487,7 +500,7 @@ export default function App() {
         if (activeThread) closeThread(activeThread);
       }
     },
-    [agents, activeAgent, activeThread, threads, createThread, closeThread],
+    [agents, activeAgent, activeThread, threads, createThread, closeThread, handleSelectAgent],
   );
 
   useEffect(() => {
@@ -864,7 +877,26 @@ export default function App() {
       </div>
 
       {canvasPanel && (
-        <aside className="canvas-panel">
+        <aside className="canvas-panel" style={{ width: canvasWidth }}>
+          <div
+            className="canvas-resize-handle"
+            onMouseDown={(event) => {
+              event.preventDefault();
+              const startX = event.clientX;
+              const startWidth = canvasWidth;
+              const onMove = (moveEvent: MouseEvent) => {
+                const max = Math.round(window.innerWidth * 0.72);
+                const next = Math.min(max, Math.max(360, startWidth - (moveEvent.clientX - startX)));
+                setCanvasWidth(next);
+              };
+              const onUp = () => {
+                window.removeEventListener("mousemove", onMove);
+                window.removeEventListener("mouseup", onUp);
+              };
+              window.addEventListener("mousemove", onMove);
+              window.addEventListener("mouseup", onUp);
+            }}
+          />
           <div className="canvas-panel-header">
             <div>
               <strong>{canvasPanel.title}</strong>

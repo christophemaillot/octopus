@@ -44,6 +44,7 @@ export default function Toolbar({
 }: ToolbarProps) {
   const ctxClass = contextPct < 50 ? "low" : contextPct < 80 ? "med" : "high";
   const choices = models.length > 0 ? models : FALLBACK_MODELS;
+  const ctxRounded = Math.round(contextPct);
   const stateLabel = runState === "idle"
     ? (agentAvailable ? "idle" : "offline")
     : runState;
@@ -63,12 +64,10 @@ export default function Toolbar({
 
       <div className="toolbar-spacer" />
 
-      <div className="context-bar">
-        <span>Contexte</span>
-        <div className="context-fill">
-          <div className={`context-fill-inner ${ctxClass}`} style={{ width: `${contextPct}%` }} />
+      <div className="context-gauge" title={`Contexte ${ctxRounded}%`}>
+        <div className={`context-gauge-ring ${ctxClass}`} style={{ "--pct": contextPct } as React.CSSProperties}>
+          <span>{ctxRounded}</span>
         </div>
-        <span>{Math.round(contextPct)}%</span>
       </div>
 
       <div className="toolbar-send-mode" title="Mode d'envoi">
@@ -78,8 +77,8 @@ export default function Toolbar({
         </select>
       </div>
 
-      <button className="toolbar-button" onClick={onOpenCanvas} disabled={!agentAvailable} title="Ouvrir le Canvas OpenClaw">
-        Canvas
+      <button className="toolbar-icon-button" onClick={onOpenCanvas} disabled={!agentAvailable} title="Ouvrir le Canvas OpenClaw">
+        ◰
       </button>
 
       <div className="toolbar-model">
