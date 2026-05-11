@@ -93,9 +93,6 @@ export default function ChatPane({
             {msg.content && (
               <div className={`msg ${msg.role}${msg.status === "pending" ? " pending" : ""}`}>
                 <FormattedMessage content={msg.content} />
-                {msg.status === "pending" && (
-                  <div className="msg-pending-label">En attente d'envoi…</div>
-                )}
                 {msg.usage && (
                   <div className="msg-footer">
                     {msg.model && <span>{msg.model}</span>}

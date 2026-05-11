@@ -661,7 +661,7 @@ export default function App() {
         clearThinkingWatchdog();
         setIsThinking(false);
         setRunState("streaming");
-        streamBufRef.current += msg.content ?? "";
+        streamBufRef.current = msg.replace ? (msg.content ?? "") : streamBufRef.current + (msg.content ?? "");
         setStreamingContent(streamBufRef.current);
         break;
       case "done": {

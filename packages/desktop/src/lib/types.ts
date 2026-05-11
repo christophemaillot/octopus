@@ -44,6 +44,7 @@ export interface HubMessage {
   statusCode?: number;
   headers?: Record<string, string>;
   bodyBase64?: string;
+  replace?: boolean;
 }
 
 export interface ReplaySession {

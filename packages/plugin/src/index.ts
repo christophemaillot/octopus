@@ -199,9 +199,56 @@ export default definePluginEntry({
     let currentSession: string | null = null;
     let currentRunId: string | null = null;
     let currentStreamText = "";
+    let sawAgentToolEvent = false;
 
     function send(msg: Record<string, unknown>) {
       if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
+    }
+
+    function sendAssistantChunk(agentId: string | null, sessionId: string | null, msgId: string | null, data: any) {
+      const fullText = typeof data?.text === "string" ? data.text : "";
+      const delta = typeof data?.delta === "string" ? data.delta : "";
+      const replace = Boolean(data?.replace);
+      if (!fullText && !delta) return;
+
+      if (replace && fullText) {
+        currentStreamText = fullText;
+        send({ type: "chunk", id: msgId, agent: agentId, session: sessionId, content: fullText, replace: true });
+        return;
+      }
+
+      if (delta) {
+        currentStreamText += delta;
+        send({ type: "chunk", id: msgId, agent: agentId, session: sessionId, content: delta });
+        return;
+      }
+
+      if (fullText === currentStreamText) return;
+      const append = fullText.startsWith(currentStreamText);
+      const content = append ? fullText.slice(currentStreamText.length) : fullText;
+      currentStreamText = fullText;
+      send({ type: "chunk", id: msgId, agent: agentId, session: sessionId, content, replace: !append });
+    }
+
+    function sendToolProgress(agentId: string | null, sessionId: string | null, msgId: string | null, data: any) {
+      const toolName = String(data?.name || data?.toolName || "tool");
+      const phase = String(data?.phase || "update");
+      const status = phase === "result" || phase === "end"
+        ? (data?.isError || data?.status === "failed" ? "error" : "completed")
+        : "running";
+      const summary = typeof data?.toolCallId === "string"
+        ? data.toolCallId
+        : (typeof data?.title === "string" ? data.title : undefined);
+      sawAgentToolEvent = true;
+      send({
+        type: "tool_progress",
+        id: msgId,
+        agent: agentId,
+        session: sessionId,
+        tool: toolName,
+        status,
+        summary,
+      });
     }
 
     function scheduleReconnect() {
@@ -304,6 +351,7 @@ export default definePluginEntry({
           currentSession = clientSession;
           currentRunId = runId;
           currentStreamText = "";
+          sawAgentToolEvent = false;
 
           send({
             type: "agent_status",
@@ -327,6 +375,17 @@ export default definePluginEntry({
             provider: selectedModel.provider,
             model: selectedModel.model,
             timeoutMs: api.runtime.agent.resolveAgentTimeoutMs(api.config),
+            onAssistantMessageStart: () => {
+              send({ type: "agent_status", id: msgId, agent: agentId, session: clientSession, status: "streaming", model: selectedModel.id });
+            },
+            onPartialReply: (payload: any) => {
+              sendAssistantChunk(agentId, clientSession, msgId, payload);
+            },
+            onAgentEvent: (evt: any) => {
+              if (evt?.stream === "assistant") sendAssistantChunk(agentId, clientSession, msgId, evt.data);
+              if (evt?.stream === "tool") sendToolProgress(agentId, clientSession, msgId, evt.data);
+              if (evt?.stream === "command_output") sendToolProgress(agentId, clientSession, msgId, { ...evt.data, phase: "update" });
+            },
           });
 
           send({
@@ -345,6 +404,7 @@ export default definePluginEntry({
           currentSession = null;
           currentRunId = null;
           currentStreamText = "";
+          sawAgentToolEvent = false;
           if (ws?.readyState !== WebSocket.OPEN) scheduleReconnect();
         }
       });
@@ -371,6 +431,7 @@ export default definePluginEntry({
     api.on("before_tool_call", async (event) => {
       if (!processing) return;
       if (currentRunId && event.runId && event.runId !== currentRunId) return;
+      if (sawAgentToolEvent) return;
       try {
         if (!event.error && String(event.toolName || "").startsWith("canvas")) {
           send({
@@ -396,6 +457,7 @@ export default definePluginEntry({
     api.on("after_tool_call", async (event) => {
       if (!processing) return;
       if (currentRunId && event.runId && event.runId !== currentRunId) return;
+      if (sawAgentToolEvent) return;
       try {
         send({
           type: "tool_progress",

@@ -101,6 +101,8 @@ struct WsMessage {
     headers: Option<serde_json::Value>,
     #[serde(default, rename = "bodyBase64", skip_serializing_if = "Option::is_none")]
     body_base64: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    replace: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -822,6 +824,7 @@ fn empty_message() -> WsMessage {
         summary: None, code: None, message: None, usage: None, seq: None, since: None,
         ack_seq: None, sessions: None, method: None, path: None, title: None, url: None,
         status_code: None, headers: None, body_base64: None,
+        replace: None,
     }
 }
 
