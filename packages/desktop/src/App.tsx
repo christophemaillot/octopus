@@ -848,7 +848,14 @@ export default function App() {
           actualModel={actualModel}
           onModelChange={handleModelChange}
           onSendModeChange={setSendMode}
-          onOpenCanvas={() => activeAgent && openCanvas(activeAgent)}
+          onOpenCanvas={() => {
+            if (!activeAgent) return;
+            if (canvasPanel?.agentId === activeAgent) {
+              setCanvasPanel(null);
+            } else {
+              openCanvas(activeAgent);
+            }
+          }}
         />
 
         <ThreadBar
