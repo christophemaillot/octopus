@@ -11,7 +11,7 @@ export interface HubState {
   lastError: string | null;
 }
 
-export function useHub(hubCfg: HubConfig): HubState {
+export function useHub(hubCfg: HubConfig | null): HubState {
   const [connected, setConnected] = useState(false);
   const [agents, setAgents] = useState<AgentInfo[]>([]);
   const [agentStatuses, setAgentStatuses] = useState<Record<string, AgentStatus>>({});
@@ -23,6 +23,7 @@ export function useHub(hubCfg: HubConfig): HubState {
 
   const connect = useCallback(() => {
     if (!mountedRef.current) return;
+    if (!hubCfg) return;
     if (wsRef.current?.readyState === WebSocket.OPEN) return;
 
     const url = hubCfg.url || "wss://octopus.chrm.fr";
@@ -31,7 +32,6 @@ export function useHub(hubCfg: HubConfig): HubState {
 
     ws.onopen = () => {
       if (!mountedRef.current) { ws.close(); return; }
-      setConnected(true);
       setLastError(null);
       // Auth as client with token from config
       ws.send(JSON.stringify({
@@ -54,6 +54,7 @@ export function useHub(hubCfg: HubConfig): HubState {
     };
 
     ws.onclose = () => {
+      if (wsRef.current !== ws) return;
       setConnected(false);
       setAgents([]);
       setAgentStatuses({});
@@ -64,14 +65,16 @@ export function useHub(hubCfg: HubConfig): HubState {
     };
 
     ws.onerror = () => {
+      if (wsRef.current !== ws) return;
       setLastError("Connection error");
     };
-  }, [hubCfg.url, hubCfg.token]);
+  }, [hubCfg]);
 
   const handleMessage = useCallback((msg: HubMessage) => {
     switch (msg.type) {
       case "auth_ok":
         console.log(`Authenticated as ${msg.kind ?? "client"}`);
+        setConnected(true);
         break;
       case "agent_list":
         if (msg.agents) {
@@ -111,7 +114,9 @@ export function useHub(hubCfg: HubConfig): HubState {
     return () => {
       mountedRef.current = false;
       if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
-      wsRef.current?.close();
+      const ws = wsRef.current;
+      wsRef.current = null;
+      ws?.close();
     };
   }, [connect]);
 

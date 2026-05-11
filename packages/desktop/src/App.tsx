@@ -50,7 +50,7 @@ function hubHttpBase(wsUrl: string): string {
 export default function App() {
   const { config } = useConfig();
   const { connected, agents, agentStatuses, sendMessage, onMessage } = useHub(
-    config?.hub ?? { url: "wss://octopus.chrm.fr", token: "" },
+    config?.hub ?? null,
   );
 
   // Active agent
