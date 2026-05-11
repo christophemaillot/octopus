@@ -463,7 +463,7 @@ export default function App() {
 
       const target = e.target as HTMLElement | null;
       const isEditing = target?.tagName === "TEXTAREA" || target?.tagName === "INPUT" || target?.isContentEditable;
-      const navMod = mod && e.altKey && !isEditing;
+      const navMod = mod && e.altKey;
 
       if (navMod && e.key === "ArrowUp") {
         e.preventDefault();
@@ -493,12 +493,12 @@ export default function App() {
         if (idx < list.length - 1) setActiveThread(list[idx + 1].id);
       }
 
-      if (e.key === "n") {
+      if (!isEditing && e.key === "n") {
         e.preventDefault();
         if (activeAgent) createThread(activeAgent);
       }
 
-      if (e.key === "w") {
+      if (!isEditing && e.key === "w") {
         e.preventDefault();
         if (activeThread) closeThread(activeThread);
       }
