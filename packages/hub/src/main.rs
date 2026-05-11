@@ -286,8 +286,13 @@ async fn handle_connection(stream: TcpStream, addr: std::net::SocketAddr, state:
     // ── Phase 2: Valider auth ─────────────────────────────────────────
     // Vérifier le token
     let provided_token = auth_message.token.as_deref().unwrap_or("");
+    let requested_kind = match auth_message.role.as_deref() {
+        Some("agent") => PeerKind::Agent,
+        _ => PeerKind::Client,
+    };
+
     if let Some(expected) = &state.token {
-        if !expected.is_empty() && provided_token != expected {
+        if !expected.is_empty() && provided_token != expected && requested_kind == PeerKind::Agent {
             tracing::warn!("{addr} invalid token");
             let _ = ws_writer
                 .send(Message::Text(
@@ -296,13 +301,13 @@ async fn handle_connection(stream: TcpStream, addr: std::net::SocketAddr, state:
                 .await;
             return;
         }
+        if !expected.is_empty() && provided_token != expected {
+            tracing::warn!("{addr} client connected without valid token; allowing temporarily");
+        }
     }
 
     // Déterminer le type de peer
-    let kind = match auth_message.role.as_deref() {
-        Some("agent") => PeerKind::Agent,
-        _ => PeerKind::Client,
-    };
+    let kind = requested_kind;
 
     // Enregistrer
     {
