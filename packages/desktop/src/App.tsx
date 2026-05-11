@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef, useEffect } from "react";
+import { useState, useCallback, useRef, useEffect, useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import Sidebar from "./components/Sidebar";
 import Toolbar from "./components/Toolbar";
@@ -93,6 +93,18 @@ export default function App() {
 
   const currentThreads = threads[activeAgent ?? ""] ?? [];
   const currentThread = currentThreads.find((t) => t.id === activeThread) ?? null;
+  const displayedContextPct = useMemo(() => {
+    const latestUsage = [...(currentThread?.messages ?? [])]
+      .reverse()
+      .find((msg) => msg.role === "assistant" && msg.usage)?.usage;
+    if (!latestUsage) return contextPct;
+    if (latestUsage.context_pct > 0) return latestUsage.context_pct;
+
+    const used = latestUsage.prompt_tokens ?? latestUsage.input_tokens;
+    const budget = latestUsage.context_tokens
+      ?? modelChoices.find((m) => m.id === agentModel)?.contextWindow;
+    return budget && budget > 0 ? Math.min(100, Math.round((used / budget) * 1000) / 10) : contextPct;
+  }, [agentModel, contextPct, currentThread?.messages, modelChoices]);
 
   // ── Create new thread ─────────────────────────────────────────────
   const createThread = useCallback((agentId: string): Thread => {
@@ -583,7 +595,7 @@ export default function App() {
           connected={connected}
           model={agentModel}
           models={modelChoices}
-          contextPct={contextPct}
+          contextPct={displayedContextPct}
           agentLabel={agentLabel}
           onModelChange={handleModelChange}
         />

@@ -29,7 +29,7 @@ export interface HubMessage {
   since?: number;
   ackSeq?: number;
   sessions?: ReplaySession[];
-  usage?: { input_tokens: number; output_tokens: number; context_pct: number };
+  usage?: UsageInfo;
   agents?: AgentInfo[];
   code?: string;
   message?: string;
@@ -41,6 +41,14 @@ export interface HubMessage {
 export interface ReplaySession {
   agent: string;
   session: string;
+}
+
+export interface UsageInfo {
+  input_tokens: number;
+  output_tokens: number;
+  context_pct: number;
+  prompt_tokens?: number;
+  context_tokens?: number;
 }
 
 export interface Thread {
@@ -58,7 +66,7 @@ export interface Message {
   content: string;
   status?: "pending" | "sent";
   toolCalls?: ToolCall[];
-  usage?: { input_tokens: number; output_tokens: number; context_pct: number };
+  usage?: UsageInfo;
   model?: string;
   timestamp: number;
 }

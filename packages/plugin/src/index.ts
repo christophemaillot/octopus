@@ -131,17 +131,26 @@ function resultModelId(result: any, fallback: string): string {
   return meta?.model || fallback;
 }
 
-function resultUsage(result: any): { input_tokens: number; output_tokens: number; context_pct: number } {
+function resultUsage(result: any): {
+  input_tokens: number;
+  output_tokens: number;
+  context_pct: number;
+  prompt_tokens?: number;
+  context_tokens?: number;
+} {
   const meta = result?.meta?.agentMeta ?? {};
   const usage = meta.usage ?? {};
-  const input = usage.input ?? meta.lastCallUsage?.input ?? 0;
-  const output = usage.output ?? meta.lastCallUsage?.output ?? 0;
-  const usedContext = meta.promptTokens ?? meta.lastCallUsage?.input ?? input;
+  const lastCallUsage = meta.lastCallUsage ?? {};
+  const input = usage.input ?? lastCallUsage.input ?? 0;
+  const output = usage.output ?? lastCallUsage.output ?? 0;
+  const promptTokens = meta.promptTokens ?? usage.total ?? lastCallUsage.total ?? lastCallUsage.input ?? input;
   const contextTokens = meta.contextTokens ?? 0;
   return {
     input_tokens: input,
     output_tokens: output,
-    context_pct: contextTokens > 0 ? Math.min(100, Math.round((usedContext / contextTokens) * 1000) / 10) : 0,
+    prompt_tokens: promptTokens,
+    context_tokens: contextTokens,
+    context_pct: contextTokens > 0 ? Math.min(100, Math.round((promptTokens / contextTokens) * 1000) / 10) : 0,
   };
 }
 
