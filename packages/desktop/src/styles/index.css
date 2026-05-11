@@ -166,12 +166,13 @@ html, body, #root {
 /* ── Toolbar ────────────────────────────────────── */
 
 .toolbar {
-  height: var(--toolbar-h);
+  min-height: var(--toolbar-h);
   border-bottom: 1px solid var(--border);
   display: flex;
   align-items: center;
-  padding: 0 16px;
-  gap: 16px;
+  flex-wrap: wrap;
+  padding: 8px 16px;
+  gap: 8px 12px;
   flex-shrink: 0;
   background: var(--bg-sidebar);
 }
@@ -182,7 +183,7 @@ html, body, #root {
   flex-shrink: 0;
 }
 
-.toolbar-spacer { flex: 1; }
+.toolbar-spacer { flex: 1 1 24px; min-width: 12px; }
 
 .toolbar-model select,
 .toolbar-send-mode select {
@@ -193,6 +194,18 @@ html, body, #root {
   padding: 4px 8px;
   font-size: 12px;
   cursor: pointer;
+  max-width: 220px;
+}
+
+.toolbar-model,
+.toolbar-send-mode,
+.context-gauge,
+.agent-availability,
+.run-pill,
+.meta-pill,
+.toolbar-icon-button,
+.connection-dot {
+  flex-shrink: 0;
 }
 
 .toolbar-icon-button {
@@ -202,6 +215,7 @@ html, body, #root {
   border-radius: var(--radius);
   width: 28px;
   height: 28px;
+  min-width: 28px;
   display: grid;
   place-items: center;
   font-size: 15px;
