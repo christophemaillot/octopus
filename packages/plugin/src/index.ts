@@ -209,7 +209,13 @@ export default definePluginEntry({
         octopusAgents = listAgents(api.config, models, api.logger);
         newWs.send(JSON.stringify({
           type: "auth", role: "agent", token: authToken,
-          agents: octopusAgents.map(({ id, label, model, models }) => ({ id, label, model, models })),
+          agents: octopusAgents.map(({ id, label, model, models }) => ({
+          id,
+          label,
+          model,
+          models,
+          thinking: api.config?.agents?.defaults?.thinking ?? api.config?.agents?.defaults?.reasoning ?? "off",
+        })),
         }));
       };
 
@@ -247,7 +253,14 @@ export default definePluginEntry({
           currentAgentId = agentId;
           currentSession = clientSession;
 
-          send({ type: "agent_status", id: msgId, agent: agentId, session: clientSession, status: "thinking" });
+          send({
+            type: "agent_status",
+            id: msgId,
+            agent: agentId,
+            session: clientSession,
+            status: "thinking",
+            model: selectedModel.id,
+          });
 
           const sessionsDir = path.join(agent.agentDir, "sessions");
           mkdirSync(sessionsDir, { recursive: true });

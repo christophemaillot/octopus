@@ -165,7 +165,8 @@ html, body, #root {
 
 .toolbar-spacer { flex: 1; }
 
-.toolbar-model select {
+.toolbar-model select,
+.toolbar-send-mode select {
   background: var(--bg);
   color: var(--text);
   border: 1px solid var(--border);
@@ -174,6 +175,25 @@ html, body, #root {
   font-size: 12px;
   cursor: pointer;
 }
+
+.agent-availability,
+.run-pill,
+.meta-pill {
+  font-size: 11px;
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 3px 8px;
+  white-space: nowrap;
+}
+
+.agent-availability.online { color: var(--green); border-color: rgba(76, 175, 80, 0.35); }
+.agent-availability.offline { color: var(--red); border-color: rgba(244, 67, 54, 0.35); }
+.run-pill.queued { color: var(--accent); border-color: rgba(79, 140, 255, 0.45); }
+.run-pill.thinking { color: var(--yellow); border-color: rgba(255, 193, 7, 0.45); }
+.run-pill.streaming { color: var(--green); border-color: rgba(76, 175, 80, 0.45); }
+.run-pill.tool { color: var(--yellow); border-color: rgba(255, 193, 7, 0.45); animation: pulse 1.5s infinite; }
+.run-pill.error { color: var(--red); border-color: rgba(244, 67, 54, 0.45); }
 
 .context-bar {
   display: flex;
@@ -468,6 +488,32 @@ html, body, #root {
 }
 
 /* ── Tool call ──────────────────────────────────── */
+
+.tool-panel {
+  align-self: flex-start;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-width: 80%;
+}
+
+.tool-panel-toggle,
+.tool-panel summary {
+  align-self: flex-start;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  border-radius: 999px;
+  padding: 3px 9px;
+  font-size: 11px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.tool-panel summary::-webkit-details-marker { display: none; }
+.tool-panel-toggle:hover,
+.tool-panel summary:hover { color: var(--text); border-color: var(--accent-dim); }
+.tool-live { color: var(--yellow); margin-left: 8px; }
 
 .tool-call {
   align-self: flex-start;

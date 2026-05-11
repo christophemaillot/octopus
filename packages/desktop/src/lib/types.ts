@@ -5,6 +5,7 @@ export interface AgentInfo {
   label: string;
   model: string;
   models?: ModelInfo[];
+  thinking?: string;
 }
 
 export interface ModelInfo {
@@ -84,3 +85,5 @@ export interface Pane {
 }
 
 export type AgentStatus = "idle" | "thinking" | "streaming" | "error";
+export type RunState = "idle" | "queued" | "thinking" | "streaming" | "tool" | "error";
+export type SendMode = "queue" | "instant";

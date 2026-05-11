@@ -7,7 +7,7 @@ import ChatPane from "./components/ChatPane";
 import { useHub } from "./hooks/useHub";
 import { useConfig } from "./hooks/useConfig";
 import { usePersistence } from "./hooks/usePersistence";
-import type { Thread, Message, ToolCall } from "./lib/types";
+import type { Thread, Message, ToolCall, RunState, SendMode } from "./lib/types";
 
 const DEFAULT_MODEL = "deepseek/deepseek-v4-flash";
 const SEND_DEBOUNCE_MS = 1500;
@@ -44,12 +44,18 @@ export default function App() {
   const [contextPct, setContextPct] = useState(0);
   const [selectedModels, setSelectedModels] = useState<Record<string, string>>({});
   const [replayStateLoaded, setReplayStateLoaded] = useState(false);
+  const [runState, setRunState] = useState<RunState>("idle");
+  const [sendMode, setSendMode] = useState<SendMode>("queue");
+  const [pendingCount, setPendingCount] = useState(0);
+  const [activeTool, setActiveTool] = useState<string | null>(null);
+  const [actualModels, setActualModels] = useState<Record<string, string>>({});
 
   // Refs for stable streaming
   const curMsgId = useRef<string | null>(null);
   const streamBufRef = useRef("");
   const curAgentRef = useRef<string | null>(null);
   const curThreadRef = useRef<string | null>(null);
+  const toolCallsRef = useRef<ToolCall[]>([]);
 
   // Send debounce refs
   const sendTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -85,6 +91,9 @@ export default function App() {
     configuredAgent?.model ??
     DEFAULT_MODEL;
   const modelChoices = activeAgentInfo?.models ?? [];
+  const agentAvailable = connected && !!activeAgentInfo;
+  const thinkingLevel = activeAgentInfo?.thinking;
+  const actualModel = activeAgent ? actualModels[activeAgent] : undefined;
 
   const handleModelChange = useCallback((nextModel: string) => {
     if (!activeAgent) return;
@@ -128,6 +137,7 @@ export default function App() {
     sendTimerRef.current = null;
 
     const pending = pendingQueueRef.current.splice(0);
+    setPendingCount(0);
     if (pending.length === 0) return;
 
     const groups = new Map<string, PendingSend[]>();
@@ -144,8 +154,11 @@ export default function App() {
       curAgentRef.current = last.agentId;
       curThreadRef.current = last.threadId;
       setStreamingContent(null);
-      setIsThinking(false);
+      setIsThinking(true);
       setToolCalls([]);
+      toolCallsRef.current = [];
+      setActiveTool(null);
+      setRunState("thinking");
       streamBufRef.current = "";
 
       setThreads((prev) => ({
@@ -198,6 +211,8 @@ export default function App() {
       content,
       model: agentModel,
     });
+    setPendingCount(pendingQueueRef.current.length);
+    setRunState("queued");
 
     setThreads((prev) => ({
       ...prev,
@@ -218,9 +233,13 @@ export default function App() {
       })(),
     }));
 
-    if (sendTimerRef.current) clearTimeout(sendTimerRef.current);
-    sendTimerRef.current = setTimeout(flushPendingQueue, SEND_DEBOUNCE_MS);
-  }, [activeAgent, currentThread, createThread, agentModel, flushPendingQueue]);
+    if (sendMode === "instant") {
+      setTimeout(flushPendingQueue, 0);
+    } else {
+      if (sendTimerRef.current) clearTimeout(sendTimerRef.current);
+      sendTimerRef.current = setTimeout(flushPendingQueue, SEND_DEBOUNCE_MS);
+    }
+  }, [activeAgent, currentThread, createThread, agentModel, flushPendingQueue, sendMode]);
 
   const notifyInputChange = useCallback(() => {}, []);
 
@@ -249,6 +268,9 @@ export default function App() {
     setStreamingContent(null);
     setIsThinking(false);
     setToolCalls([]);
+    toolCallsRef.current = [];
+    setActiveTool(null);
+    setRunState("idle");
     streamBufRef.current = "";
   }, [activeAgent, activeThread, sendMessage]);
 
@@ -259,6 +281,9 @@ export default function App() {
     setStreamingContent(null);
     setIsThinking(false);
     setToolCalls([]);
+    toolCallsRef.current = [];
+    setActiveTool(null);
+    setRunState("idle");
   }, []);
 
   // ── Close thread ─────────────────────────────────────────────────
@@ -273,6 +298,7 @@ export default function App() {
         clearTimeout(sendTimerRef.current);
         sendTimerRef.current = null;
       }
+      setPendingCount(pendingQueueRef.current.length);
     }
 
     if (activeThread === threadId && curThreadRef.current === threadId && curMsgId.current) {
@@ -289,6 +315,9 @@ export default function App() {
       setStreamingContent(null);
       setIsThinking(false);
       setToolCalls([]);
+      toolCallsRef.current = [];
+      setActiveTool(null);
+      setRunState("idle");
     }
 
     sendMessage({
@@ -496,10 +525,16 @@ export default function App() {
       case "agent_status":
         if (msg.id && curMsgId.current === msg.id && msg.status === "thinking") {
           setIsThinking(true);
+          setRunState("thinking");
+          if (msg.model && msg.agent) {
+            setActualModels((prev) => ({ ...prev, [msg.agent]: msg.model }));
+          }
         }
         break;
       case "chunk":
+        if (msg.id && curMsgId.current && msg.id !== curMsgId.current) break;
         setIsThinking(false);
+        setRunState("streaming");
         streamBufRef.current += msg.content ?? "";
         setStreamingContent(streamBufRef.current);
         break;
@@ -508,12 +543,16 @@ export default function App() {
         const agentId = msg.agent ?? (isCurrentMessage ? curAgentRef.current : null);
         const threadId = msg.session ?? (isCurrentMessage ? curThreadRef.current : null);
         const finalContent = (isCurrentMessage ? streamBufRef.current : "") || msg.content || "";
+        const completedToolCalls = isCurrentMessage ? toolCallsRef.current : [];
 
         if (isCurrentMessage) {
           streamBufRef.current = "";
           setStreamingContent(null);
           setIsThinking(false);
           setToolCalls([]);
+          toolCallsRef.current = [];
+          setActiveTool(null);
+          setRunState("idle");
           setContextPct(msg.usage?.context_pct ?? 0);
           curMsgId.current = null;
           curAgentRef.current = null;
@@ -525,10 +564,14 @@ export default function App() {
             id: `assist-${msg.id}`,
             role: "assistant",
             content: finalContent,
+            toolCalls: completedToolCalls,
             usage: msg.usage,
             model: msg.model,
             timestamp: Date.now(),
           };
+          if (msg.model) {
+            setActualModels((prev) => ({ ...prev, [agentId]: msg.model }));
+          }
           setThreads((prev) => {
             const list = prev[agentId] ?? [];
             const existing = list.find((t) => t.id === threadId);
@@ -556,15 +599,27 @@ export default function App() {
         }
         break;
       }
+      case "error":
+        if (msg.id && curMsgId.current && msg.id !== curMsgId.current) break;
+        setRunState("error");
+        setIsThinking(false);
+        setStreamingContent(null);
+        setActiveTool(null);
+        break;
       case "tool_progress":
+        if (msg.id && curMsgId.current && msg.id !== curMsgId.current) break;
+        setRunState(msg.status === "completed" ? "streaming" : "tool");
+        setActiveTool(msg.status === "completed" ? null : (msg.tool ?? null));
         setToolCalls((prev) => {
           const filtered = prev.filter(
             (t) => !(t.tool === msg.tool && t.status === "running"),
           );
-          return [
+          const next = [
             ...filtered,
             { tool: msg.tool, status: msg.status ?? "running", summary: msg.summary },
           ];
+          toolCallsRef.current = next;
+          return next;
         });
         break;
     }
@@ -597,7 +652,15 @@ export default function App() {
           models={modelChoices}
           contextPct={displayedContextPct}
           agentLabel={agentLabel}
+          agentAvailable={agentAvailable}
+          runState={runState}
+          sendMode={sendMode}
+          pendingCount={pendingCount}
+          activeTool={activeTool}
+          thinkingLevel={thinkingLevel}
+          actualModel={actualModel}
           onModelChange={handleModelChange}
+          onSendModeChange={setSendMode}
         />
 
         <ThreadBar
@@ -617,6 +680,7 @@ export default function App() {
               streamingContent={streamingContent}
               isThinking={isThinking}
               toolCalls={toolCalls}
+              runState={runState}
               onSend={handleSend}
               onCancel={handleCancel}
               onInputChange={notifyInputChange}

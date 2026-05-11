@@ -106,6 +106,8 @@ struct AgentInfo {
     id: String,
     label: String,
     model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thinking: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     models: Vec<ModelInfo>,
 }

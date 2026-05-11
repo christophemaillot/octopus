@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from "react";
 import { marked } from "marked";
-import type { Thread, ToolCall } from "../lib/types";
+import type { Thread, ToolCall, RunState } from "../lib/types";
 
 marked.use({ gfm: true, breaks: true });
 
@@ -9,6 +9,7 @@ interface ChatPaneProps {
   streamingContent: string | null;
   isThinking: boolean;
   toolCalls: ToolCall[];
+  runState: RunState;
   onSend: (content: string, immediate?: boolean) => void;
   onCancel: () => void;
   onInputChange?: () => void;
@@ -19,11 +20,13 @@ export default function ChatPane({
   streamingContent,
   isThinking,
   toolCalls,
+  runState,
   onSend,
   onCancel,
   onInputChange,
 }: ChatPaneProps) {
   const [input, setInput] = useState("");
+  const [showTools, setShowTools] = useState(true);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
@@ -79,9 +82,14 @@ export default function ChatPane({
 
         {messages.map((msg) => (
           <div key={msg.id} className={`message-row ${msg.role}${msg.status === "pending" ? " pending" : ""}`}>
-            {msg.toolCalls?.map((tc, i) => (
-              <ToolCallBadge key={i} call={tc} />
-            ))}
+            {!!msg.toolCalls?.length && (
+              <details className="tool-panel compact">
+                <summary>tools · {msg.toolCalls.length}</summary>
+                {msg.toolCalls.map((tc, i) => (
+                  <ToolCallBadge key={i} call={tc} />
+                ))}
+              </details>
+            )}
             {msg.content && (
               <div className={`msg ${msg.role}${msg.status === "pending" ? " pending" : ""}`}>
                 <FormattedMessage content={msg.content} />
@@ -104,9 +112,17 @@ export default function ChatPane({
         ))}
 
         {/* Streaming tool calls */}
-        {toolCalls.map((tc, i) => (
-          <ToolCallBadge key={`stream-${i}`} call={tc} />
-        ))}
+        {toolCalls.length > 0 && (
+          <div className="tool-panel">
+            <button className="tool-panel-toggle" onClick={() => setShowTools((v) => !v)}>
+              {showTools ? "▾" : "▸"} tools · {toolCalls.length}
+              {runState === "tool" && <span className="tool-live">running</span>}
+            </button>
+            {showTools && toolCalls.map((tc, i) => (
+              <ToolCallBadge key={`stream-${i}`} call={tc} />
+            ))}
+          </div>
+        )}
 
         {/* Streaming content */}
         {isThinking && !streamingContent && (
