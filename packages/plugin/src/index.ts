@@ -173,6 +173,7 @@ export default definePluginEntry({
     let processing = false;
     let currentMsgId: string | null = null;
     let currentAgentId: string | null = null;
+    let currentSession: string | null = null;
 
     function send(msg: Record<string, unknown>) {
       if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
@@ -232,10 +233,12 @@ export default definePluginEntry({
           if (!agent) throw new Error(`agent '${agentId}' is not configured`);
           const selectedModel = splitModelId(String(msg.model || agent.model));
           const sessionId = `octopus:${agentId}:${msg.session || randomUUID()}`;
+          const clientSession = String(msg.session || sessionId);
           currentMsgId = msgId;
           currentAgentId = agentId;
+          currentSession = clientSession;
 
-          send({ type: "agent_status", id: msgId, agent: agentId, status: "thinking" });
+          send({ type: "agent_status", id: msgId, agent: agentId, session: clientSession, status: "thinking" });
 
           const sessionsDir = path.join(agent.agentDir, "sessions");
           mkdirSync(sessionsDir, { recursive: true });
@@ -253,18 +256,19 @@ export default definePluginEntry({
           });
 
           send({
-            type: "done", id: msgId, agent: agentId,
+            type: "done", id: msgId, agent: agentId, session: clientSession,
             content: resultText(result),
             usage: resultUsage(result),
             model: resultModelId(result, selectedModel.id),
           });
         } catch (e: any) {
           api.logger.error(`octopus: ${e.message}`);
-          send({ type: "error", id: currentMsgId, agent: currentAgentId, code: "agent_error", message: e.message });
+          send({ type: "error", id: currentMsgId, agent: currentAgentId, session: currentSession, code: "agent_error", message: e.message });
         } finally {
           processing = false;
           currentMsgId = null;
           currentAgentId = null;
+          currentSession = null;
           if (ws?.readyState !== WebSocket.OPEN) scheduleReconnect();
         }
       });
@@ -274,17 +278,17 @@ export default definePluginEntry({
 
     api.on("llm_output", async (event) => {
       if (!processing) return;
-      try { send({ type: "chunk", id: currentMsgId, agent: currentAgentId, content: (event.output as any)?.text || "" }); } catch {}
+      try { send({ type: "chunk", id: currentMsgId, agent: currentAgentId, session: currentSession, content: (event.output as any)?.text || "" }); } catch {}
     });
 
     api.on("before_tool_call", async (event) => {
       if (!processing) return;
-      try { send({ type: "tool_progress", id: currentMsgId, agent: currentAgentId, tool: event.toolName, status: "running" }); } catch {}
+      try { send({ type: "tool_progress", id: currentMsgId, agent: currentAgentId, session: currentSession, tool: event.toolName, status: "running" }); } catch {}
     });
 
     api.on("after_tool_call", async (event) => {
       if (!processing) return;
-      try { send({ type: "tool_progress", id: currentMsgId, agent: currentAgentId, tool: event.toolName, status: "completed" }); } catch {}
+      try { send({ type: "tool_progress", id: currentMsgId, agent: currentAgentId, session: currentSession, tool: event.toolName, status: "completed" }); } catch {}
     });
 
     api.on("gateway_stop", () => {

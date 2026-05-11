@@ -1,4 +1,5 @@
 import { useState, useCallback, useRef, useEffect } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import Sidebar from "./components/Sidebar";
 import Toolbar from "./components/Toolbar";
 import ThreadBar from "./components/ThreadBar";
@@ -42,6 +43,7 @@ export default function App() {
   const [toolCalls, setToolCalls] = useState<ToolCall[]>([]);
   const [contextPct, setContextPct] = useState(0);
   const [selectedModels, setSelectedModels] = useState<Record<string, string>>({});
+  const [replayStateLoaded, setReplayStateLoaded] = useState(false);
 
   // Refs for stable streaming
   const curMsgId = useRef<string | null>(null);
@@ -52,6 +54,9 @@ export default function App() {
   // Send debounce refs
   const sendTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingQueueRef = useRef<PendingSend[]>([]);
+  const replayRequestedRef = useRef(false);
+  const lastSeqRef = useRef(0);
+  const ackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Load persisted threads on mount
   useEffect(() => {
@@ -189,7 +194,11 @@ export default function App() {
         if (list.some((t) => t.id === thread.id)) {
           return list.map((t) =>
             t.id === thread.id
-              ? { ...t, messages: [...t.messages, userMsg], title: content.slice(0, 40) }
+              ? {
+                  ...t,
+                  messages: [...t.messages, userMsg],
+                  title: t.titleLocked ? t.title : content.slice(0, 40),
+                }
               : t,
           );
         }
@@ -240,6 +249,74 @@ export default function App() {
     setToolCalls([]);
   }, []);
 
+  // ── Close thread ─────────────────────────────────────────────────
+  const closeThread = useCallback((threadId: string) => {
+    if (!activeAgent) return;
+
+    if (sendTimerRef.current) {
+      pendingQueueRef.current = pendingQueueRef.current.filter(
+        (item) => !(item.agentId === activeAgent && item.threadId === threadId),
+      );
+      if (pendingQueueRef.current.length === 0) {
+        clearTimeout(sendTimerRef.current);
+        sendTimerRef.current = null;
+      }
+    }
+
+    if (activeThread === threadId && curThreadRef.current === threadId && curMsgId.current) {
+      sendMessage({
+        type: "cancel",
+        id: curMsgId.current,
+        agent: activeAgent,
+        session: threadId,
+      });
+      curMsgId.current = null;
+      curThreadRef.current = null;
+      curAgentRef.current = null;
+      streamBufRef.current = "";
+      setStreamingContent(null);
+      setIsThinking(false);
+      setToolCalls([]);
+    }
+
+    sendMessage({
+      type: "close_thread",
+      agent: activeAgent,
+      session: threadId,
+    });
+
+    setThreads((prev) => {
+      const list = prev[activeAgent] ?? [];
+      const idx = list.findIndex((t) => t.id === threadId);
+      if (idx < 0) return prev;
+
+      const nextList = list.filter((t) => t.id !== threadId);
+      if (activeThread === threadId) {
+        const nextActive = nextList[Math.min(idx, nextList.length - 1)]?.id ?? null;
+        setActiveThread(nextActive);
+      }
+
+      return {
+        ...prev,
+        [activeAgent]: nextList,
+      };
+    });
+  }, [activeAgent, activeThread, sendMessage]);
+
+  const renameThread = useCallback((threadId: string, title: string) => {
+    if (!activeAgent) return;
+    const nextTitle = title.trim() || "Nouveau";
+
+    setThreads((prev) => ({
+      ...prev,
+      [activeAgent]: (prev[activeAgent] ?? []).map((t) =>
+        t.id === threadId
+          ? { ...t, title: nextTitle, titleLocked: true }
+          : t,
+      ),
+    }));
+  }, [activeAgent]);
+
   // ── Keyboard shortcuts ──────────────────────────────────────────
   const handleKeyDown = useCallback(
     (e: KeyboardEvent) => {
@@ -278,8 +355,13 @@ export default function App() {
         e.preventDefault();
         if (activeAgent) createThread(activeAgent);
       }
+
+      if (e.key === "w") {
+        e.preventDefault();
+        if (activeThread) closeThread(activeThread);
+      }
     },
-    [agents, activeAgent, activeThread, threads, createThread],
+    [agents, activeAgent, activeThread, threads, createThread, closeThread],
   );
 
   useEffect(() => {
@@ -287,9 +369,118 @@ export default function App() {
     return () => document.removeEventListener("keydown", handleKeyDown);
   }, [handleKeyDown]);
 
+  useEffect(() => {
+    (async () => {
+      try {
+        const raw: string | null = await invoke("load_replay_state");
+        if (raw) {
+          const state = JSON.parse(raw) as { lastSeq?: number };
+          lastSeqRef.current = state.lastSeq ?? 0;
+        }
+      } catch (e) {
+        console.warn("No replay state found:", e);
+      }
+      setReplayStateLoaded(true);
+    })();
+  }, []);
+
+  useEffect(() => {
+    if (!connected) {
+      replayRequestedRef.current = false;
+      return;
+    }
+    if (!replayStateLoaded) return;
+    if (replayRequestedRef.current) return;
+
+    replayRequestedRef.current = true;
+    sendMessage({ type: "replay", since: lastSeqRef.current });
+  }, [connected, replayStateLoaded, sendMessage]);
+
+  const ackSeq = useCallback((seq?: number) => {
+    if (!seq || seq <= lastSeqRef.current) return;
+    lastSeqRef.current = seq;
+
+    if (ackTimerRef.current) clearTimeout(ackTimerRef.current);
+    ackTimerRef.current = setTimeout(() => {
+      const lastSeq = lastSeqRef.current;
+      sendMessage({ type: "ack", ackSeq: lastSeq });
+      invoke("save_replay_state", { data: JSON.stringify({ lastSeq }) }).catch((e) =>
+        console.warn("Failed to save replay state:", e),
+      );
+    }, 250);
+  }, [sendMessage]);
+
   // ── Streaming responses ─────────────────────────────────────────
   const handleStreamMsg = useCallback((msg: any) => {
+    ackSeq(msg.seq);
+
     switch (msg.type) {
+      case "close_thread": {
+        const agentId = msg.agent;
+        const threadId = msg.session;
+        if (!agentId || !threadId) break;
+
+        setThreads((prev) => ({
+          ...prev,
+          [agentId]: (prev[agentId] ?? []).filter((t) => t.id !== threadId),
+        }));
+
+        if (activeAgent === agentId && activeThread === threadId) {
+          setActiveThread(null);
+        }
+        break;
+      }
+      case "send_message": {
+        const agentId = msg.agent;
+        const threadId = msg.session;
+        if (!agentId || !threadId || !msg.id) break;
+
+        const userMsg: Message = {
+          id: `user-${msg.id}`,
+          role: "user",
+          content: msg.content ?? "",
+          status: "sent",
+          timestamp: Date.now(),
+        };
+
+        setThreads((prev) => {
+          const list = prev[agentId] ?? [];
+          const existing = list.find((t) => t.id === threadId);
+          if (!existing) {
+            return {
+              ...prev,
+              [agentId]: [{
+                id: threadId,
+                agentId,
+                title: (msg.content ?? "Nouveau").slice(0, 40),
+                messages: [userMsg],
+                createdAt: Date.now(),
+              }, ...list],
+            };
+          }
+
+          return {
+            ...prev,
+            [agentId]: list.map((t) => {
+              if (t.id !== threadId) return t;
+              if (t.messages.some((m) => m.id === userMsg.id)) {
+                return {
+                  ...t,
+                  messages: t.messages.map((m) =>
+                    m.id === userMsg.id ? { ...m, status: "sent" } : m,
+                  ),
+                };
+              }
+              return {
+                ...t,
+                messages: [...t.messages, userMsg],
+                title: t.titleLocked ? t.title : userMsg.content.slice(0, 40),
+              };
+            }),
+          };
+        });
+        break;
+      }
       case "agent_status":
         if (msg.id && curMsgId.current === msg.id && msg.status === "thinking") {
           setIsThinking(true);
@@ -300,38 +491,59 @@ export default function App() {
         streamBufRef.current += msg.content ?? "";
         setStreamingContent(streamBufRef.current);
         break;
-      case "done":
-        if (msg.id && curMsgId.current === msg.id) {
-          const agentId = msg.agent ?? curAgentRef.current;
-          const threadId = curThreadRef.current;
-          const finalContent = streamBufRef.current || msg.content || "";
+      case "done": {
+        const isCurrentMessage = msg.id && curMsgId.current === msg.id;
+        const agentId = msg.agent ?? (isCurrentMessage ? curAgentRef.current : null);
+        const threadId = msg.session ?? (isCurrentMessage ? curThreadRef.current : null);
+        const finalContent = (isCurrentMessage ? streamBufRef.current : "") || msg.content || "";
 
+        if (isCurrentMessage) {
           streamBufRef.current = "";
           setStreamingContent(null);
           setIsThinking(false);
           setToolCalls([]);
           setContextPct(msg.usage?.context_pct ?? 0);
+          curMsgId.current = null;
+          curAgentRef.current = null;
+          curThreadRef.current = null;
+        }
 
-          if (agentId && threadId) {
-            const assMsg: Message = {
-              id: `assist-${msg.id}`,
-              role: "assistant",
-              content: finalContent,
-              usage: msg.usage,
-              model: msg.model,
-              timestamp: Date.now(),
-            };
-            setThreads((prev) => ({
+        if (agentId && threadId && msg.id) {
+          const assMsg: Message = {
+            id: `assist-${msg.id}`,
+            role: "assistant",
+            content: finalContent,
+            usage: msg.usage,
+            model: msg.model,
+            timestamp: Date.now(),
+          };
+          setThreads((prev) => {
+            const list = prev[agentId] ?? [];
+            const existing = list.find((t) => t.id === threadId);
+            if (!existing) {
+              return {
+                ...prev,
+                [agentId]: [{
+                  id: threadId,
+                  agentId,
+                  title: "Thread restauré",
+                  messages: [assMsg],
+                  createdAt: Date.now(),
+                }, ...list],
+              };
+            }
+
+            return {
               ...prev,
-              [agentId]: (prev[agentId] ?? []).map((t) =>
-                t.id === threadId
-                  ? { ...t, messages: [...t.messages, assMsg] }
-                  : t,
-              ),
-            }));
-          }
+              [agentId]: list.map((t) => {
+                if (t.id !== threadId || t.messages.some((m) => m.id === assMsg.id)) return t;
+                return { ...t, messages: [...t.messages, assMsg] };
+              }),
+            };
+          });
         }
         break;
+      }
       case "tool_progress":
         setToolCalls((prev) => {
           const filtered = prev.filter(
@@ -344,7 +556,7 @@ export default function App() {
         });
         break;
     }
-  }, []);
+  }, [ackSeq, activeAgent, activeThread]);
 
   useEffect(() => {
     const unsub = onMessage(handleStreamMsg);
@@ -380,6 +592,8 @@ export default function App() {
           threads={currentThreads}
           activeThread={activeThread}
           onSelect={setActiveThread}
+          onClose={closeThread}
+          onRename={renameThread}
           onNew={() => activeAgent && createThread(activeAgent)}
         />
 

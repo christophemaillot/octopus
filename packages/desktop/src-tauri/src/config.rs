@@ -131,3 +131,21 @@ pub fn load_threads() -> Result<Option<String>, String> {
         Err(_) => Ok(None),
     }
 }
+
+#[tauri::command]
+pub fn save_replay_state(data: String) -> Result<(), String> {
+    let dir = sessions_dir();
+    fs::create_dir_all(&dir).map_err(|e| format!("create dir: {e}"))?;
+    let path = dir.join("replay-state.json");
+    fs::write(&path, &data).map_err(|e| format!("write: {e}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn load_replay_state() -> Result<Option<String>, String> {
+    let path = sessions_dir().join("replay-state.json");
+    match fs::read_to_string(&path) {
+        Ok(content) => Ok(Some(content)),
+        Err(_) => Ok(None),
+    }
+}

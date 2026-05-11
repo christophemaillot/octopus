@@ -15,6 +15,9 @@ use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, Write};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
@@ -34,6 +37,9 @@ struct Args {
     #[arg(long)]
     token: Option<String>,
 
+    /// Répertoire de persistence du hub
+    #[arg(long)]
+    data_dir: Option<String>,
 }
 
 // ── Message types ────────────────────────────────────────────────────────────
@@ -68,6 +74,31 @@ struct WsMessage {
     code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    usage: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    since: Option<u64>,
+    #[serde(default, rename = "ackSeq", skip_serializing_if = "Option::is_none")]
+    ack_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sessions: Option<Vec<ReplaySession>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct ReplaySession {
+    agent: String,
+    session: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct PersistedEvent {
+    seq: u64,
+    timestamp_ms: u128,
+    agent: String,
+    session: String,
+    message: WsMessage,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -83,7 +114,11 @@ struct AgentInfo {
 struct ModelInfo {
     id: String,
     label: String,
-    #[serde(default, rename = "contextWindow", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "contextWindow",
+        skip_serializing_if = "Option::is_none"
+    )]
     context_window: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     available: Option<bool>,
@@ -116,6 +151,9 @@ struct AppState {
     agent_routes: Mutex<HashMap<String, String>>,
     /// Index: message_id → client peer_id (pour éviter de broadcaster une réponse à tous les clients)
     pending_requests: Mutex<HashMap<String, String>>,
+    events: Mutex<Vec<PersistedEvent>>,
+    next_seq: Mutex<u64>,
+    event_log_path: PathBuf,
     token: Option<String>,
 }
 
@@ -130,10 +168,27 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     tracing::info!("octopus-hub starting on :{}", args.port);
 
+    let data_dir = args
+        .data_dir
+        .map(PathBuf::from)
+        .unwrap_or_else(default_data_dir);
+    fs::create_dir_all(&data_dir)?;
+    let event_log_path = data_dir.join("events.jsonl");
+    let events = load_events(&event_log_path)?;
+    let next_seq = events.last().map(|event| event.seq + 1).unwrap_or(1);
+    tracing::info!(
+        "loaded {} persisted events from {}",
+        events.len(),
+        event_log_path.display()
+    );
+
     let state = Arc::new(AppState {
         peers: Mutex::new(HashMap::new()),
         agent_routes: Mutex::new(HashMap::new()),
         pending_requests: Mutex::new(HashMap::new()),
+        events: Mutex::new(events),
+        next_seq: Mutex::new(next_seq),
+        event_log_path,
         token: args.token,
     });
 
@@ -152,11 +207,7 @@ async fn main() -> anyhow::Result<()> {
 
 // ── Connection handler ────────────────────────────────────────────────────────
 
-async fn handle_connection(
-    stream: TcpStream,
-    addr: std::net::SocketAddr,
-    state: Arc<AppState>,
-) {
+async fn handle_connection(stream: TcpStream, addr: std::net::SocketAddr, state: Arc<AppState>) {
     let ws_stream = match accept_async(stream).await {
         Ok(ws) => ws,
         Err(e) => {
@@ -257,15 +308,18 @@ async fn handle_connection(
 
             if let Some(peer) = peers.get_mut(&peer_id) {
                 for agent in agents {
-                    peer.hosted_agents
-                        .insert(agent.id.clone(), agent.clone());
+                    peer.hosted_agents.insert(agent.id.clone(), agent.clone());
                 }
             }
         }
     }
 
     // Répondre auth_ok
-    let kind_str = if kind == PeerKind::Agent { "agent" } else { "client" };
+    let kind_str = if kind == PeerKind::Agent {
+        "agent"
+    } else {
+        "client"
+    };
     let ack = serde_json::json!({
         "type": "auth_ok",
         "peer_id": peer_id,
@@ -330,6 +384,9 @@ async fn route_message(msg: WsMessage, sender_id: &str, state: &Arc<AppState>) {
         // Un client envoie un message vers un agent
         "send_message" => {
             let agent_id = msg.agent.as_deref().unwrap_or("main");
+            if let Err(err) = persist_event(msg.clone(), state).await {
+                tracing::warn!("failed to persist send_message: {err}");
+            }
             if let Some(message_id) = &msg.id {
                 let mut pending = state.pending_requests.lock().await;
                 pending.insert(message_id.clone(), sender_id.to_string());
@@ -340,9 +397,9 @@ async fn route_message(msg: WsMessage, sender_id: &str, state: &Arc<AppState>) {
             if let Some(peer_id) = agent_routes.get(agent_id) {
                 let peers = state.peers.lock().await;
                 if let Some(peer) = peers.get(peer_id) {
-                    let _ = peer.tx.send(Message::Text(
-                        serde_json::to_string(&msg).unwrap(),
-                    ));
+                    let _ = peer
+                        .tx
+                        .send(Message::Text(serde_json::to_string(&msg).unwrap()));
                 }
             } else {
                 // Agent inconnu, renvoyer une erreur à l'émetteur
@@ -358,9 +415,44 @@ async fn route_message(msg: WsMessage, sender_id: &str, state: &Arc<AppState>) {
             }
         }
 
+        // Un client ferme un thread. C'est une tombstone persistée: les replays futurs
+        // peuvent supprimer le thread et la compaction retire son historique.
+        "close_thread" => {
+            if let Err(err) = persist_event(msg.clone(), state).await {
+                tracing::warn!("failed to persist close_thread: {err}");
+            }
+
+            if let (Some(agent), Some(session)) = (&msg.agent, &msg.session) {
+                tracing::info!("thread closed: {agent}/{session}");
+            }
+
+            if let Err(err) = compact_events(state).await {
+                tracing::warn!("failed to compact after close_thread: {err}");
+            }
+
+            let peers = state.peers.lock().await;
+            for (peer_id, peer) in peers.iter() {
+                if peer_id == sender_id || peer.kind == PeerKind::Agent {
+                    continue;
+                }
+                let _ = peer
+                    .tx
+                    .send(Message::Text(serde_json::to_string(&msg).unwrap()));
+            }
+        }
+
         // Une réponse d'agent → client qui a émis la requête si l'id est connu,
         // fallback broadcast pour les messages globaux sans id.
         "chunk" | "done" | "tool_progress" | "agent_status" | "error" | "pong" => {
+            if matches!(
+                msg.msg_type.as_str(),
+                "chunk" | "done" | "tool_progress" | "agent_status" | "error"
+            ) {
+                if let Err(err) = persist_event(msg.clone(), state).await {
+                    tracing::warn!("failed to persist {}: {err}", msg.msg_type);
+                }
+            }
+
             let target_peer_id = if let Some(message_id) = &msg.id {
                 let pending = state.pending_requests.lock().await;
                 pending.get(message_id).cloned()
@@ -371,9 +463,9 @@ async fn route_message(msg: WsMessage, sender_id: &str, state: &Arc<AppState>) {
             let peers = state.peers.lock().await;
             if let Some(peer_id) = target_peer_id {
                 if let Some(peer) = peers.get(&peer_id) {
-                    let _ = peer.tx.send(Message::Text(
-                        serde_json::to_string(&msg).unwrap(),
-                    ));
+                    let _ = peer
+                        .tx
+                        .send(Message::Text(serde_json::to_string(&msg).unwrap()));
                 }
                 drop(peers);
                 if matches!(msg.msg_type.as_str(), "done" | "error") {
@@ -390,9 +482,9 @@ async fn route_message(msg: WsMessage, sender_id: &str, state: &Arc<AppState>) {
                 if peer_id == sender_id {
                     continue;
                 }
-                let _ = peer.tx.send(Message::Text(
-                    serde_json::to_string(&msg).unwrap(),
-                ));
+                let _ = peer
+                    .tx
+                    .send(Message::Text(serde_json::to_string(&msg).unwrap()));
             }
         }
 
@@ -424,6 +516,58 @@ async fn route_message(msg: WsMessage, sender_id: &str, state: &Arc<AppState>) {
             }
         }
 
+        // Un client reconnecté demande les événements persistés.
+        // V1: replay de tous les événements depuis `since` (0 par défaut), avec filtre sessions optionnel.
+        "replay" => {
+            let since = msg.since.unwrap_or(0);
+            let session_filter = msg.sessions.as_ref().map(|sessions| {
+                sessions
+                    .iter()
+                    .map(|s| (s.agent.clone(), s.session.clone()))
+                    .collect::<std::collections::HashSet<_>>()
+            });
+
+            let events = state.events.lock().await;
+            let replay: Vec<WsMessage> = events
+                .iter()
+                .filter(|event| event.seq > since)
+                .filter(|event| {
+                    session_filter
+                        .as_ref()
+                        .map(|filter| {
+                            filter.contains(&(event.agent.clone(), event.session.clone()))
+                        })
+                        .unwrap_or(true)
+                })
+                .map(|event| {
+                    let mut message = event.message.clone();
+                    message.seq = Some(event.seq);
+                    message
+                })
+                .collect();
+            drop(events);
+
+            let peers = state.peers.lock().await;
+            if let Some(sender) = peers.get(sender_id) {
+                for message in replay {
+                    let _ = sender
+                        .tx
+                        .send(Message::Text(serde_json::to_string(&message).unwrap()));
+                }
+            }
+        }
+
+        // Ack desktop: v2 uses this as a cheap compaction trigger. The hub remains
+        // stateless per-client for now; the durable cursor lives in the desktop.
+        "ack" => {
+            if let Some(seq) = msg.ack_seq {
+                tracing::debug!("client {sender_id} acked seq {seq}");
+            }
+            if let Err(err) = compact_events(state).await {
+                tracing::warn!("failed to compact on ack: {err}");
+            }
+        }
+
         _ => {
             tracing::warn!("unhandled message type: {}", msg.msg_type);
         }
@@ -432,19 +576,23 @@ async fn route_message(msg: WsMessage, sender_id: &str, state: &Arc<AppState>) {
 
 // ── Cleanup ───────────────────────────────────────────────────────────────────
 
-async fn cleanup_peer(
-    peer_id: &str,
-    hosted_agents: &[String],
-    state: &Arc<AppState>,
-) {
+async fn cleanup_peer(peer_id: &str, hosted_agents: &[String], state: &Arc<AppState>) {
     let mut agent_routes = state.agent_routes.lock().await;
     for agent_id in hosted_agents {
-        if agent_routes.get(agent_id).map(|s| s == peer_id).unwrap_or(false) {
+        if agent_routes
+            .get(agent_id)
+            .map(|s| s == peer_id)
+            .unwrap_or(false)
+        {
             agent_routes.remove(agent_id);
             tracing::info!("agent {agent_id} deregistered");
         }
     }
     drop(agent_routes);
+
+    let mut pending = state.pending_requests.lock().await;
+    pending.retain(|_, pending_peer_id| pending_peer_id != peer_id);
+    drop(pending);
 
     let mut peers = state.peers.lock().await;
     peers.remove(peer_id);
@@ -458,4 +606,144 @@ fn fast_rand() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos() as u64
+}
+
+fn default_data_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("OCTOPUS_HUB_DATA_DIR") {
+        return PathBuf::from(dir);
+    }
+
+    std::env::var("HOME")
+        .map(|home| PathBuf::from(home).join(".local/share/octopus-hub"))
+        .unwrap_or_else(|_| PathBuf::from("./octopus-hub-data"))
+}
+
+fn load_events(path: &PathBuf) -> anyhow::Result<Vec<PersistedEvent>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut events = Vec::new();
+
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        match serde_json::from_str::<PersistedEvent>(&line) {
+            Ok(event) => events.push(event),
+            Err(err) => tracing::warn!("skipping invalid event log line: {err}"),
+        }
+    }
+
+    events.sort_by_key(|event| event.seq);
+    Ok(events)
+}
+
+async fn persist_event(
+    mut message: WsMessage,
+    state: &Arc<AppState>,
+) -> anyhow::Result<Option<u64>> {
+    let Some(agent) = message.agent.clone() else {
+        return Ok(None);
+    };
+    let Some(session) = message.session.clone() else {
+        return Ok(None);
+    };
+
+    let mut next_seq = state.next_seq.lock().await;
+    let seq = *next_seq;
+    *next_seq += 1;
+    drop(next_seq);
+
+    message.seq = Some(seq);
+    let event = PersistedEvent {
+        seq,
+        timestamp_ms: now_millis(),
+        agent,
+        session,
+        message,
+    };
+
+    let mut events = state.events.lock().await;
+    events.push(event.clone());
+    drop(events);
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&state.event_log_path)?;
+    serde_json::to_writer(&mut file, &event)?;
+    file.write_all(b"\n")?;
+    file.flush()?;
+
+    Ok(Some(seq))
+}
+
+async fn compact_events(state: &Arc<AppState>) -> anyhow::Result<()> {
+    let mut events = state.events.lock().await;
+    let mut closed_sessions = std::collections::HashSet::new();
+    let mut completed_messages = std::collections::HashSet::new();
+
+    for event in events.iter() {
+        if event.message.msg_type == "close_thread" {
+            closed_sessions.insert((event.agent.clone(), event.session.clone()));
+        }
+        if matches!(event.message.msg_type.as_str(), "done" | "error") {
+            if let Some(id) = &event.message.id {
+                completed_messages.insert(id.clone());
+            }
+        }
+    }
+
+    let compacted: Vec<PersistedEvent> = events
+        .iter()
+        .filter(|event| {
+            let key = (event.agent.clone(), event.session.clone());
+            if closed_sessions.contains(&key) && event.message.msg_type != "close_thread" {
+                return false;
+            }
+
+            if matches!(
+                event.message.msg_type.as_str(),
+                "chunk" | "tool_progress" | "agent_status"
+            ) {
+                if let Some(id) = &event.message.id {
+                    return !completed_messages.contains(id);
+                }
+            }
+
+            true
+        })
+        .cloned()
+        .collect();
+
+    if compacted.len() == events.len() {
+        return Ok(());
+    }
+
+    let tmp_path = state.event_log_path.with_extension("jsonl.tmp");
+    {
+        let mut file = File::create(&tmp_path)?;
+        for event in &compacted {
+            serde_json::to_writer(&mut file, event)?;
+            file.write_all(b"\n")?;
+        }
+        file.flush()?;
+    }
+    fs::rename(&tmp_path, &state.event_log_path)?;
+    *events = compacted;
+
+    Ok(())
+}
+
+fn now_millis() -> u128 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
 }

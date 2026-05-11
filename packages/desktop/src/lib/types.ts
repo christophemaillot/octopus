@@ -25,6 +25,10 @@ export interface HubMessage {
   tool?: string;
   summary?: string;
   index?: number;
+  seq?: number;
+  since?: number;
+  ackSeq?: number;
+  sessions?: ReplaySession[];
   usage?: { input_tokens: number; output_tokens: number; context_pct: number };
   agents?: AgentInfo[];
   code?: string;
@@ -34,10 +38,16 @@ export interface HubMessage {
   role?: string;
 }
 
+export interface ReplaySession {
+  agent: string;
+  session: string;
+}
+
 export interface Thread {
   id: string;
   agentId: string;
   title: string;
+  titleLocked?: boolean;
   messages: Message[];
   createdAt: number;
 }

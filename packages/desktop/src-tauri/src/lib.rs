@@ -16,6 +16,8 @@ pub fn run() {
             config::avatar_exists,
             config::save_threads,
             config::load_threads,
+            config::save_replay_state,
+            config::load_replay_state,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
