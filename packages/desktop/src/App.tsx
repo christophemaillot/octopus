@@ -76,6 +76,7 @@ export default function App() {
   const [actualModels, setActualModels] = useState<Record<string, string>>({});
   const [canvasPanel, setCanvasPanel] = useState<CanvasPanelState | null>(null);
   const [canvasWidth, setCanvasWidth] = useState(560);
+  const [canvasResizing, setCanvasResizing] = useState(false);
   const [gatewayNotice, setGatewayNotice] = useState<GatewayNotice | null>(null);
 
   // Refs for stable streaming
@@ -884,19 +885,31 @@ export default function App() {
               event.preventDefault();
               const startX = event.clientX;
               const startWidth = canvasWidth;
+              setCanvasResizing(true);
+              document.body.style.cursor = "col-resize";
+              document.body.style.userSelect = "none";
+
+              const cleanup = () => {
+                setCanvasResizing(false);
+                document.body.style.cursor = "";
+                document.body.style.userSelect = "";
+                window.removeEventListener("mousemove", onMove);
+                window.removeEventListener("mouseup", onUp);
+                window.removeEventListener("blur", cleanup);
+              };
               const onMove = (moveEvent: MouseEvent) => {
                 const max = Math.round(window.innerWidth * 0.72);
                 const next = Math.min(max, Math.max(360, startWidth - (moveEvent.clientX - startX)));
                 setCanvasWidth(next);
               };
-              const onUp = () => {
-                window.removeEventListener("mousemove", onMove);
-                window.removeEventListener("mouseup", onUp);
-              };
+              const onUp = () => cleanup();
+
               window.addEventListener("mousemove", onMove);
               window.addEventListener("mouseup", onUp);
+              window.addEventListener("blur", cleanup);
             }}
           />
+          {canvasResizing && <div className="canvas-resize-overlay" />}
           <div className="canvas-panel-header">
             <div>
               <strong>{canvasPanel.title}</strong>

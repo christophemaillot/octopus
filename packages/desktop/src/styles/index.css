@@ -322,6 +322,14 @@ html, body, #root {
 
 .canvas-resize-handle:hover { background: rgba(79, 140, 255, 0.22); }
 
+.canvas-resize-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  cursor: col-resize;
+  background: transparent;
+}
+
 .canvas-panel-header {
   height: 42px;
   flex-shrink: 0;
