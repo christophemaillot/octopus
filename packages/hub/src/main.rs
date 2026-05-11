@@ -286,9 +286,6 @@ async fn handle_connection(stream: TcpStream, addr: std::net::SocketAddr, state:
     // ── Phase 2: Valider auth ─────────────────────────────────────────
     // Vérifier le token
     let provided_token = auth_message.token.as_deref().unwrap_or("");
-    // Dev mode: skip token validation for now
-    // In production, uncomment the validation block below
-    /*
     if let Some(expected) = &state.token {
         if !expected.is_empty() && provided_token != expected {
             tracing::warn!("{addr} invalid token");
@@ -300,8 +297,6 @@ async fn handle_connection(stream: TcpStream, addr: std::net::SocketAddr, state:
             return;
         }
     }
-    */
-    tracing::info!("{addr} authenticated (dev mode, no token check)");
 
     // Déterminer le type de peer
     let kind = match auth_message.role.as_deref() {
