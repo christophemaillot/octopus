@@ -378,9 +378,6 @@ export default definePluginEntry({
             onAssistantMessageStart: () => {
               send({ type: "agent_status", id: msgId, agent: agentId, session: clientSession, status: "streaming", model: selectedModel.id });
             },
-            onPartialReply: (payload: any) => {
-              sendAssistantChunk(agentId, clientSession, msgId, payload);
-            },
             onAgentEvent: (evt: any) => {
               if (evt?.stream === "assistant") sendAssistantChunk(agentId, clientSession, msgId, evt.data);
               if (evt?.stream === "tool") sendToolProgress(agentId, clientSession, msgId, evt.data);
