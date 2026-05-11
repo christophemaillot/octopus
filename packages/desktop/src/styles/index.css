@@ -37,6 +37,25 @@ html, body, #root {
 
 .app { display: flex; height: 100%; }
 
+.gateway-notice {
+  position: fixed;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 20;
+  padding: 8px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: rgba(22, 33, 62, 0.94);
+  color: var(--text);
+  font-size: 12px;
+  box-shadow: 0 10px 35px rgba(0,0,0,0.35);
+  backdrop-filter: blur(10px);
+}
+
+.gateway-notice.connected { border-color: rgba(76, 175, 80, 0.45); }
+.gateway-notice.disconnected { border-color: rgba(244, 67, 54, 0.45); }
+
 /* ── Sidebar ────────────────────────────────────── */
 
 .sidebar {

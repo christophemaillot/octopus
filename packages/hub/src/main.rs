@@ -358,6 +358,7 @@ async fn handle_connection(stream: TcpStream, addr: std::net::SocketAddr, state:
 
     if kind == PeerKind::Agent {
         broadcast_agent_list(&state).await;
+        broadcast_gateway_status(&state, &hosted_agent_ids, "connected", "Gateway agent connected").await;
     }
 
     // ── Phase 3: Boucle de messages ───────────────────────────────────
@@ -430,6 +431,24 @@ async fn broadcast_agent_list(state: &Arc<AppState>) {
     let resp = serde_json::json!({
         "type": "agent_list",
         "agents": agent_list,
+    });
+    let peers = state.peers.lock().await;
+    for peer in peers.values() {
+        if peer.kind == PeerKind::Client {
+            let _ = peer.tx.send(Message::Text(resp.to_string()));
+        }
+    }
+}
+
+async fn broadcast_gateway_status(state: &Arc<AppState>, agents: &[String], status: &str, message: &str) {
+    if agents.is_empty() {
+        return;
+    }
+    let resp = serde_json::json!({
+        "type": "gateway_status",
+        "status": status,
+        "agents": agents,
+        "message": message,
     });
     let peers = state.peers.lock().await;
     for peer in peers.values() {
@@ -668,6 +687,7 @@ async fn cleanup_peer(peer_id: &str, hosted_agents: &[String], state: &Arc<AppSt
 
     if !hosted_agents.is_empty() {
         broadcast_agent_list(state).await;
+        broadcast_gateway_status(state, hosted_agents, "disconnected", "Gateway agent disconnected").await;
     }
 }
 

@@ -37,6 +37,7 @@ export interface HubMessage {
   peer_id?: string;
   kind?: string;
   role?: string;
+  agentIds?: string[];
   title?: string;
   url?: string;
   path?: string;

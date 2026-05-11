@@ -26,6 +26,13 @@ interface CanvasPanelState {
   url: string;
 }
 
+interface GatewayNotice {
+  id: string;
+  status: "connected" | "disconnected";
+  agentIds: string[];
+  text: string;
+}
+
 function hubHttpBase(wsUrl: string): string {
   try {
     const url = new URL(wsUrl || "wss://octopus.chrm.fr");
@@ -68,6 +75,7 @@ export default function App() {
   const [activeTool, setActiveTool] = useState<string | null>(null);
   const [actualModels, setActualModels] = useState<Record<string, string>>({});
   const [canvasPanel, setCanvasPanel] = useState<CanvasPanelState | null>(null);
+  const [gatewayNotice, setGatewayNotice] = useState<GatewayNotice | null>(null);
 
   // Refs for stable streaming
   const curMsgId = useRef<string | null>(null);
@@ -85,6 +93,13 @@ export default function App() {
   const thinkingWatchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const previousConnectedRef = useRef<boolean | null>(null);
   const previousAgentIdsRef = useRef<Set<string>>(new Set());
+  const noticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const showGatewayNotice = useCallback((notice: Omit<GatewayNotice, "id">) => {
+    if (noticeTimerRef.current) clearTimeout(noticeTimerRef.current);
+    setGatewayNotice({ ...notice, id: crypto.randomUUID() });
+    noticeTimerRef.current = setTimeout(() => setGatewayNotice(null), 6000);
+  }, []);
 
   const addSystemMessage = useCallback((agentId: string, threadId: string | null, content: string) => {
     const targetThreadId = threadId ?? (threads[agentId]?.[0]?.id ?? null);
@@ -642,6 +657,21 @@ export default function App() {
         openCanvas(agentId, msg.title ?? "Canvas", msg.url ?? `/canvas/${agentId}/`);
         break;
       }
+      case "gateway_status": {
+        const agentIds = Array.isArray((msg as any).agents)
+          ? (msg as any).agents.map(String)
+          : (msg.agent ? [msg.agent] : []);
+        const status = msg.status === "disconnected" ? "disconnected" : "connected";
+        const names = agentIds.join(", ") || "agent";
+        const text = status === "connected"
+          ? `🟢 Gateway reconnecté : ${names}`
+          : `🔴 Gateway déconnecté : ${names}`;
+        showGatewayNotice({ status, agentIds, text });
+        if (activeAgent && agentIds.includes(activeAgent)) {
+          addSystemMessage(activeAgent, activeThread, text);
+        }
+        break;
+      }
       case "agent_status":
         if (msg.id && curMsgId.current === msg.id && msg.status === "thinking") {
           setIsThinking(true);
@@ -760,7 +790,7 @@ export default function App() {
         });
         break;
     }
-  }, [ackSeq, activeAgent, activeThread, armThinkingWatchdog, clearThinkingWatchdog, openCanvas]);
+  }, [ackSeq, activeAgent, activeThread, addSystemMessage, armThinkingWatchdog, clearThinkingWatchdog, openCanvas, showGatewayNotice]);
 
   useEffect(() => {
     const unsub = onMessage(handleStreamMsg);
@@ -781,6 +811,12 @@ export default function App() {
           (config?.agents ?? []).map((a) => [a.id, a.label]),
         )}
       />
+
+      {gatewayNotice && (
+        <div className={`gateway-notice ${gatewayNotice.status}`}>
+          {gatewayNotice.text}
+        </div>
+      )}
 
       <div className="main">
         <Toolbar
