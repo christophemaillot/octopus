@@ -57,6 +57,9 @@ export interface Thread {
   agentId: string;
   title: string;
   titleLocked?: boolean;
+  contextPct?: number;
+  contextUsage?: UsageInfo;
+  model?: string;
   messages: Message[];
   createdAt: number;
 }

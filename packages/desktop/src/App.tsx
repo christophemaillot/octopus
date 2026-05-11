@@ -41,7 +41,6 @@ export default function App() {
   const [streamingContent, setStreamingContent] = useState<string | null>(null);
   const [isThinking, setIsThinking] = useState(false);
   const [toolCalls, setToolCalls] = useState<ToolCall[]>([]);
-  const [contextPct, setContextPct] = useState(0);
   const [selectedModels, setSelectedModels] = useState<Record<string, string>>({});
   const [replayStateLoaded, setReplayStateLoaded] = useState(false);
   const [runState, setRunState] = useState<RunState>("idle");
@@ -103,17 +102,15 @@ export default function App() {
   const currentThreads = threads[activeAgent ?? ""] ?? [];
   const currentThread = currentThreads.find((t) => t.id === activeThread) ?? null;
   const displayedContextPct = useMemo(() => {
-    const latestUsage = [...(currentThread?.messages ?? [])]
-      .reverse()
-      .find((msg) => msg.role === "assistant" && msg.usage)?.usage;
-    if (!latestUsage) return contextPct;
-    if (latestUsage.context_pct > 0) return latestUsage.context_pct;
+    const usage = currentThread?.contextUsage;
+    if (!usage) return currentThread?.contextPct ?? 0;
+    if (usage.context_pct > 0) return usage.context_pct;
 
-    const used = latestUsage.prompt_tokens ?? latestUsage.input_tokens;
-    const budget = latestUsage.context_tokens
-      ?? modelChoices.find((m) => m.id === agentModel)?.contextWindow;
-    return budget && budget > 0 ? Math.min(100, Math.round((used / budget) * 1000) / 10) : contextPct;
-  }, [agentModel, contextPct, currentThread?.messages, modelChoices]);
+    const used = usage.prompt_tokens ?? usage.input_tokens;
+    const budget = usage.context_tokens
+      ?? modelChoices.find((m) => m.id === (currentThread?.model ?? agentModel))?.contextWindow;
+    return budget && budget > 0 ? Math.min(100, Math.round((used / budget) * 1000) / 10) : (currentThread?.contextPct ?? 0);
+  }, [agentModel, currentThread?.contextPct, currentThread?.contextUsage, currentThread?.model, modelChoices]);
 
   // ── Create new thread ─────────────────────────────────────────────
   const createThread = useCallback((agentId: string): Thread => {
@@ -553,7 +550,6 @@ export default function App() {
           toolCallsRef.current = [];
           setActiveTool(null);
           setRunState("idle");
-          setContextPct(msg.usage?.context_pct ?? 0);
           curMsgId.current = null;
           curAgentRef.current = null;
           curThreadRef.current = null;
@@ -582,6 +578,9 @@ export default function App() {
                   id: threadId,
                   agentId,
                   title: "Thread restauré",
+                  contextPct: msg.usage?.context_pct,
+                  contextUsage: msg.usage,
+                  model: msg.model,
                   messages: [assMsg],
                   createdAt: Date.now(),
                 }, ...list],
@@ -591,8 +590,15 @@ export default function App() {
             return {
               ...prev,
               [agentId]: list.map((t) => {
-                if (t.id !== threadId || t.messages.some((m) => m.id === assMsg.id)) return t;
-                return { ...t, messages: [...t.messages, assMsg] };
+                if (t.id !== threadId) return t;
+                const base = {
+                  ...t,
+                  contextPct: msg.usage?.context_pct ?? t.contextPct,
+                  contextUsage: msg.usage ?? t.contextUsage,
+                  model: msg.model ?? t.model,
+                };
+                if (t.messages.some((m) => m.id === assMsg.id)) return base;
+                return { ...base, messages: [...t.messages, assMsg] };
               }),
             };
           });
