@@ -55,6 +55,8 @@ export function useHub(hubCfg: HubConfig): HubState {
 
     ws.onclose = () => {
       setConnected(false);
+      setAgents([]);
+      setAgentStatuses({});
       wsRef.current = null;
       if (mountedRef.current) {
         reconnectTimerRef.current = setTimeout(connect, 3000);
@@ -74,9 +76,11 @@ export function useHub(hubCfg: HubConfig): HubState {
       case "agent_list":
         if (msg.agents) {
           setAgents(msg.agents);
-          const statuses: Record<string, AgentStatus> = {};
-          msg.agents.forEach((a) => (statuses[a.id] = "idle"));
-          setAgentStatuses(statuses);
+          setAgentStatuses((prev) => {
+            const next: Record<string, AgentStatus> = {};
+            msg.agents!.forEach((a) => (next[a.id] = prev[a.id] ?? "idle"));
+            return next;
+          });
         }
         break;
       case "agent_status":
@@ -94,6 +98,9 @@ export function useHub(hubCfg: HubConfig): HubState {
         break;
       case "error":
         setLastError(msg.message ?? "Unknown error");
+        if (msg.agent) {
+          setAgentStatuses((prev) => ({ ...prev, [msg.agent!]: "error" }));
+        }
         break;
     }
   }, []);

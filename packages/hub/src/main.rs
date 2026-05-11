@@ -354,6 +354,10 @@ async fn handle_connection(stream: TcpStream, addr: std::net::SocketAddr, state:
     let _ = ws_writer.send(Message::Text(ack.to_string())).await;
     tracing::info!("{addr} authenticated as {kind:?} (peer={peer_id})");
 
+    if kind == PeerKind::Agent {
+        broadcast_agent_list(&state).await;
+    }
+
     // ── Phase 3: Boucle de messages ───────────────────────────────────
 
     let peer_id_r = peer_id.clone();
@@ -401,6 +405,36 @@ async fn handle_connection(stream: TcpStream, addr: std::net::SocketAddr, state:
     // ── Nettoyage ─────────────────────────────────────────────────────
     cleanup_peer(&peer_id, &hosted_agent_ids, &state).await;
     tracing::info!("peer {peer_id} disconnected ({addr})");
+}
+
+async fn current_agent_list(state: &Arc<AppState>) -> Vec<AgentInfo> {
+    let agent_routes = state.agent_routes.lock().await;
+    let peers = state.peers.lock().await;
+
+    let mut agent_list: Vec<AgentInfo> = Vec::new();
+    for (agent_id, peer_id) in agent_routes.iter() {
+        if let Some(peer) = peers.get(peer_id) {
+            if let Some(info) = peer.hosted_agents.get(agent_id) {
+                agent_list.push(info.clone());
+            }
+        }
+    }
+    agent_list.sort_by(|a, b| a.id.cmp(&b.id));
+    agent_list
+}
+
+async fn broadcast_agent_list(state: &Arc<AppState>) {
+    let agent_list = current_agent_list(state).await;
+    let resp = serde_json::json!({
+        "type": "agent_list",
+        "agents": agent_list,
+    });
+    let peers = state.peers.lock().await;
+    for peer in peers.values() {
+        if peer.kind == PeerKind::Client {
+            let _ = peer.tx.send(Message::Text(resp.to_string()));
+        }
+    }
 }
 
 // ── Routing ───────────────────────────────────────────────────────────────────
@@ -537,22 +571,7 @@ async fn route_message(msg: WsMessage, sender_id: &str, state: &Arc<AppState>) {
 
         // Un client demande la liste des agents
         "list_agents" => {
-            let agent_routes = state.agent_routes.lock().await;
-            let peers = state.peers.lock().await;
-
-            let mut agent_list: Vec<AgentInfo> = Vec::new();
-            for (agent_id, peer_id) in agent_routes.iter() {
-                if let Some(peer) = peers.get(peer_id) {
-                    if let Some(info) = peer.hosted_agents.get(agent_id) {
-                        agent_list.push(info.clone());
-                    }
-                }
-            }
-
-            // Drop locks before sending response to avoid deadlock
-            drop(agent_routes);
-            drop(peers);
-
+            let agent_list = current_agent_list(state).await;
             let peers = state.peers.lock().await;
             if let Some(sender) = peers.get(sender_id) {
                 let resp = serde_json::json!({
@@ -643,6 +662,11 @@ async fn cleanup_peer(peer_id: &str, hosted_agents: &[String], state: &Arc<AppSt
 
     let mut peers = state.peers.lock().await;
     peers.remove(peer_id);
+    drop(peers);
+
+    if !hosted_agents.is_empty() {
+        broadcast_agent_list(state).await;
+    }
 }
 
 // ── Minimal HTTP surface ─────────────────────────────────────────────────────

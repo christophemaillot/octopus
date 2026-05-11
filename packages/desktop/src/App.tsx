@@ -82,6 +82,47 @@ export default function App() {
   const replayRequestedRef = useRef(false);
   const lastSeqRef = useRef(0);
   const ackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const thinkingWatchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const previousConnectedRef = useRef<boolean | null>(null);
+  const previousAgentIdsRef = useRef<Set<string>>(new Set());
+
+  const addSystemMessage = useCallback((agentId: string, threadId: string | null, content: string) => {
+    const targetThreadId = threadId ?? (threads[agentId]?.[0]?.id ?? null);
+    if (!targetThreadId) return;
+    const sysMsg: Message = {
+      id: `system-${crypto.randomUUID()}`,
+      role: "system",
+      content,
+      timestamp: Date.now(),
+    };
+    setThreads((prev) => ({
+      ...prev,
+      [agentId]: (prev[agentId] ?? []).map((t) =>
+        t.id === targetThreadId
+          ? { ...t, messages: [...t.messages, sysMsg] }
+          : t,
+      ),
+    }));
+  }, [threads]);
+
+  const clearThinkingWatchdog = useCallback(() => {
+    if (thinkingWatchdogRef.current) {
+      clearTimeout(thinkingWatchdogRef.current);
+      thinkingWatchdogRef.current = null;
+    }
+  }, []);
+
+  const armThinkingWatchdog = useCallback(() => {
+    clearThinkingWatchdog();
+    thinkingWatchdogRef.current = setTimeout(() => {
+      if (!curMsgId.current) return;
+      setIsThinking(false);
+      setRunState("error");
+      const agentId = curAgentRef.current;
+      const threadId = curThreadRef.current;
+      if (agentId) addSystemMessage(agentId, threadId, "⚠️ Réponse interrompue : l'agent ne donne plus de nouvelles.");
+    }, 90_000);
+  }, [addSystemMessage, clearThinkingWatchdog]);
 
   // Load persisted threads on mount
   useEffect(() => {
@@ -187,6 +228,7 @@ export default function App() {
       setActiveTool(null);
       setRunState("thinking");
       streamBufRef.current = "";
+      armThinkingWatchdog();
 
       setThreads((prev) => ({
         ...prev,
@@ -213,7 +255,7 @@ export default function App() {
         model: last.model,
       });
     }
-  }, [sendMessage]);
+  }, [armThinkingWatchdog, sendMessage]);
 
   // ── Debounced send ──────────────────────────────────────────────
   const queueSend = useCallback((content: string) => {
@@ -299,7 +341,8 @@ export default function App() {
     setActiveTool(null);
     setRunState("idle");
     streamBufRef.current = "";
-  }, [activeAgent, activeThread, sendMessage]);
+    clearThinkingWatchdog();
+  }, [activeAgent, activeThread, clearThinkingWatchdog, sendMessage]);
 
   // ── Select agent ─────────────────────────────────────────────────
   const handleSelectAgent = useCallback((id: string) => {
@@ -464,6 +507,51 @@ export default function App() {
     sendMessage({ type: "replay", since: lastSeqRef.current });
   }, [connected, replayStateLoaded, sendMessage]);
 
+  useEffect(() => {
+    if (previousConnectedRef.current === null) {
+      previousConnectedRef.current = connected;
+      return;
+    }
+    if (previousConnectedRef.current === connected) return;
+
+    previousConnectedRef.current = connected;
+    if (activeAgent) {
+      addSystemMessage(
+        activeAgent,
+        activeThread,
+        connected ? "🟢 Connexion au hub Octopus rétablie." : "🔴 Connexion au hub Octopus perdue.",
+      );
+    }
+  }, [activeAgent, activeThread, addSystemMessage, connected]);
+
+  useEffect(() => {
+    const nextIds = new Set(agents.map((agent) => agent.id));
+    const prevIds = previousAgentIdsRef.current;
+
+    if (prevIds.size > 0) {
+      for (const id of prevIds) {
+        if (!nextIds.has(id)) {
+          addSystemMessage(id, id === activeAgent ? activeThread : null, "🔴 Gateway/agent déconnecté du hub Octopus.");
+          if (id === curAgentRef.current) {
+            clearThinkingWatchdog();
+            setIsThinking(false);
+            setStreamingContent(null);
+            setActiveTool(null);
+            setRunState("error");
+          }
+        }
+      }
+
+      for (const id of nextIds) {
+        if (!prevIds.has(id)) {
+          addSystemMessage(id, id === activeAgent ? activeThread : null, "🟢 Gateway/agent reconnecté au hub Octopus.");
+        }
+      }
+    }
+
+    previousAgentIdsRef.current = nextIds;
+  }, [activeAgent, activeThread, addSystemMessage, agents, clearThinkingWatchdog]);
+
   const ackSeq = useCallback((seq?: number) => {
     if (!seq || seq <= lastSeqRef.current) return;
     lastSeqRef.current = seq;
@@ -558,13 +646,19 @@ export default function App() {
         if (msg.id && curMsgId.current === msg.id && msg.status === "thinking") {
           setIsThinking(true);
           setRunState("thinking");
+          armThinkingWatchdog();
           if (msg.model && msg.agent) {
             setActualModels((prev) => ({ ...prev, [msg.agent]: msg.model }));
           }
         }
+        if (msg.id && curMsgId.current === msg.id && msg.status === "idle") {
+          setIsThinking(false);
+          clearThinkingWatchdog();
+        }
         break;
       case "chunk":
         if (msg.id && curMsgId.current && msg.id !== curMsgId.current) break;
+        clearThinkingWatchdog();
         setIsThinking(false);
         setRunState("streaming");
         streamBufRef.current += msg.content ?? "";
@@ -585,6 +679,7 @@ export default function App() {
           toolCallsRef.current = [];
           setActiveTool(null);
           setRunState("idle");
+          clearThinkingWatchdog();
           curMsgId.current = null;
           curAgentRef.current = null;
           curThreadRef.current = null;
@@ -642,6 +737,7 @@ export default function App() {
       }
       case "error":
         if (msg.id && curMsgId.current && msg.id !== curMsgId.current) break;
+        clearThinkingWatchdog();
         setRunState("error");
         setIsThinking(false);
         setStreamingContent(null);
@@ -664,7 +760,7 @@ export default function App() {
         });
         break;
     }
-  }, [ackSeq, activeAgent, activeThread, openCanvas]);
+  }, [ackSeq, activeAgent, activeThread, armThinkingWatchdog, clearThinkingWatchdog, openCanvas]);
 
   useEffect(() => {
     const unsub = onMessage(handleStreamMsg);
