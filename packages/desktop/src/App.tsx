@@ -24,6 +24,7 @@ interface CanvasPanelState {
   agentId: string;
   title: string;
   url: string;
+  reloadKey: number;
 }
 
 interface GatewayNotice {
@@ -185,6 +186,7 @@ export default function App() {
       agentId,
       title: title || `${agentId} Canvas`,
       url: absoluteUrl,
+      reloadKey: Date.now(),
     });
   }, [activeAgent, config?.hub?.url]);
 
@@ -924,7 +926,12 @@ export default function App() {
             </div>
             <button onClick={() => setCanvasPanel(null)} title="Fermer le Canvas">×</button>
           </div>
-          <iframe title={canvasPanel.title} src={canvasPanel.url} sandbox="allow-scripts allow-forms allow-popups allow-modals" />
+          <iframe
+            key={`${canvasPanel.url}-${canvasPanel.reloadKey}`}
+            title={canvasPanel.title}
+            src={`${canvasPanel.url}${canvasPanel.url.includes("?") ? "&" : "?"}_octopusReload=${canvasPanel.reloadKey}`}
+            sandbox="allow-scripts allow-forms allow-popups allow-modals"
+          />
         </aside>
       )}
     </div>
