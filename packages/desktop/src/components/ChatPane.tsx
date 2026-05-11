@@ -81,7 +81,7 @@ export default function ChatPane({
         )}
 
         {messages.map((msg) => (
-          <div key={msg.id} className={`message-row ${msg.role}${msg.status === "pending" ? " pending" : ""}`}>
+          <div key={msg.id} className={`message-row ${msg.role}${msg.status === "pending" ? " pending" : ""}${msg.deliveryMode === "steer" ? " steer" : ""}`}>
             {!!msg.toolCalls?.length && (
               <details className="tool-panel compact">
                 <summary>tools · {msg.toolCalls.length}</summary>
@@ -91,7 +91,8 @@ export default function ChatPane({
               </details>
             )}
             {msg.content && (
-              <div className={`msg ${msg.role}${msg.status === "pending" ? " pending" : ""}`}>
+              <div className={`msg ${msg.role}${msg.status === "pending" ? " pending" : ""}${msg.deliveryMode === "steer" ? " steer" : ""}`}>
+                {msg.deliveryMode === "steer" && <div className="msg-mode-badge" title="Message injecté dans le run en cours">↪ orienter</div>}
                 <FormattedMessage content={msg.content} />
                 {msg.usage && (
                   <div className="msg-footer">

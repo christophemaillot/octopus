@@ -6,6 +6,7 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import path from "node:path";
+import { isEmbeddedAgentRunActive, queueEmbeddedAgentMessage } from "openclaw/plugin-sdk/agents/pi-embedded";
 
 let GLOBAL_LOCK = false;
 
@@ -352,7 +353,6 @@ export default definePluginEntry({
 
         if (msg.type !== "send_message") return;
 
-        processing = true;
         try {
           const msgId = msg.id || randomUUID();
           const agentId = msg.agent || "main";
@@ -361,6 +361,23 @@ export default definePluginEntry({
           const selectedModel = splitModelId(String(msg.model || agent.model));
           const sessionId = `octopus:${agentId}:${msg.session || randomUUID()}`;
           const clientSession = String(msg.session || sessionId);
+          if (isEmbeddedAgentRunActive(sessionId)) {
+            const queued = queueEmbeddedAgentMessage(sessionId, msg.content || "", {
+              steeringMode: "all",
+              debounceMs: 250,
+            });
+            send({
+              type: "message_delivery",
+              id: msgId,
+              agent: agentId,
+              session: clientSession,
+              deliveryMode: queued ? "steer" : "turn",
+              status: queued ? "steered" : "queued",
+            });
+            if (queued) return;
+          }
+
+          processing = true;
           const runId = randomUUID();
           currentMsgId = msgId;
           currentAgentId = agentId;
@@ -368,6 +385,15 @@ export default definePluginEntry({
           currentRunId = runId;
           currentStreamText = "";
           sawAgentToolEvent = false;
+
+          send({
+            type: "message_delivery",
+            id: msgId,
+            agent: agentId,
+            session: clientSession,
+            deliveryMode: "turn",
+            status: "running",
+          });
 
           send({
             type: "agent_status",

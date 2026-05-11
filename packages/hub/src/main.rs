@@ -65,6 +65,8 @@ struct WsMessage {
     content: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     model: Option<String>,
+    #[serde(default, rename = "deliveryMode", skip_serializing_if = "Option::is_none")]
+    delivery_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -545,10 +547,10 @@ async fn route_message(msg: WsMessage, sender_id: &str, state: &Arc<AppState>) {
             }
         }
 
-        "chunk" | "done" | "tool_progress" | "agent_status" | "error" | "pong" => {
+        "chunk" | "done" | "tool_progress" | "agent_status" | "message_delivery" | "error" | "pong" => {
             if matches!(
                 msg.msg_type.as_str(),
-                "chunk" | "done" | "tool_progress" | "agent_status" | "error"
+                "chunk" | "done" | "tool_progress" | "agent_status" | "message_delivery" | "error"
             ) {
                 if let Err(err) = persist_event(msg.clone(), state).await {
                     tracing::warn!("failed to persist {}: {err}", msg.msg_type);
@@ -840,7 +842,7 @@ async fn proxy_canvas_request(agent: &str, method: &str, path: &str, state: Arc<
 fn empty_message() -> WsMessage {
     WsMessage {
         msg_type: String::new(), id: None, role: None, agent: None, agents: None,
-        session: None, content: None, model: None, token: None, status: None, tool: None,
+        session: None, content: None, model: None, delivery_mode: None, token: None, status: None, tool: None,
         summary: None, code: None, message: None, usage: None, seq: None, since: None,
         ack_seq: None, sessions: None, method: None, path: None, title: None, url: None,
         status_code: None, headers: None, body_base64: None,

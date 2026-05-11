@@ -22,6 +22,7 @@ export interface HubMessage {
   session?: string;
   content?: string;
   model?: string;
+  deliveryMode?: "turn" | "steer";
   status?: string;
   tool?: string;
   summary?: string;
@@ -78,6 +79,7 @@ export interface Message {
   role: "user" | "assistant" | "system";
   content: string;
   status?: "pending" | "sent";
+  deliveryMode?: "turn" | "steer";
   toolCalls?: ToolCall[];
   usage?: UsageInfo;
   model?: string;

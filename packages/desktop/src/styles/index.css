@@ -519,6 +519,18 @@ html, body, #root {
   background: color-mix(in srgb, var(--accent) 70%, transparent);
 }
 
+.msg.user.steer {
+  background: color-mix(in srgb, var(--violet, #b794f4) 72%, var(--accent));
+  border: 1px solid rgba(183, 148, 244, 0.55);
+}
+
+.msg-mode-badge {
+  font-size: 10px;
+  color: rgba(255,255,255,0.82);
+  margin-bottom: 4px;
+  letter-spacing: 0.01em;
+}
+
 .msg.assistant {
   align-self: flex-start;
   background: var(--bg-pane);

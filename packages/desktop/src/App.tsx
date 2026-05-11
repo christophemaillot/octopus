@@ -258,7 +258,7 @@ export default function App() {
                 ...t,
                 messages: t.messages.map((msg) =>
                   items.some((item) => msg.id === `user-${item.id}`)
-                    ? { ...msg, status: "sent" }
+                    ? { ...msg, status: "sent", deliveryMode: "turn" }
                     : msg,
                 ),
               }
@@ -627,6 +627,7 @@ export default function App() {
           role: "user",
           content: msg.content ?? "",
           status: "sent",
+          deliveryMode: msg.deliveryMode === "steer" ? "steer" : "turn",
           timestamp: Date.now(),
         };
 
@@ -686,6 +687,25 @@ export default function App() {
         if (activeAgent && agentIds.includes(activeAgent)) {
           addSystemMessage(activeAgent, activeThread, text);
         }
+        break;
+      }
+      case "message_delivery": {
+        if (!msg.id || !msg.agent || !msg.session) break;
+        setThreads((prev) => ({
+          ...prev,
+          [msg.agent!]: (prev[msg.agent!] ?? []).map((t) =>
+            t.id === msg.session
+              ? {
+                  ...t,
+                  messages: t.messages.map((m) =>
+                    m.id === `user-${msg.id}`
+                      ? { ...m, status: "sent", deliveryMode: msg.deliveryMode === "steer" ? "steer" : "turn" }
+                      : m,
+                  ),
+                }
+              : t,
+          ),
+        }));
         break;
       }
       case "agent_status":
