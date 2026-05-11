@@ -230,15 +230,31 @@ export default definePluginEntry({
       send({ type: "chunk", id: msgId, agent: agentId, session: sessionId, content, replace: !append });
     }
 
+    function compactJson(value: unknown, max = 180): string | undefined {
+      if (value == null) return undefined;
+      try {
+        const raw = typeof value === "string" ? value : JSON.stringify(value);
+        return raw.length > max ? `${raw.slice(0, max - 1)}…` : raw;
+      } catch {
+        const raw = String(value);
+        return raw.length > max ? `${raw.slice(0, max - 1)}…` : raw;
+      }
+    }
+
     function sendToolProgress(agentId: string | null, sessionId: string | null, msgId: string | null, data: any) {
       const toolName = String(data?.name || data?.toolName || "tool");
       const phase = String(data?.phase || "update");
       const status = phase === "result" || phase === "end"
         ? (data?.isError || data?.status === "failed" ? "error" : "completed")
         : "running";
-      const summary = typeof data?.toolCallId === "string"
-        ? data.toolCallId
-        : (typeof data?.title === "string" ? data.title : undefined);
+      const args = data?.args ?? data?.meta?.args ?? data?.meta?.params ?? data?.params;
+      const summary = phase === "start"
+        ? compactJson(args) ?? "starting"
+        : phase === "update"
+          ? compactJson(data?.partialResult ?? data?.output ?? data?.progressText, 140) ?? "running"
+          : data?.isError
+            ? compactJson(data?.error ?? data?.result, 160) ?? "error"
+            : "done";
       sawAgentToolEvent = true;
       send({
         type: "tool_progress",
