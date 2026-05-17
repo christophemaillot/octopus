@@ -12,8 +12,12 @@ interface ToolbarProps {
   activeTool: string | null;
   thinkingLevel?: string;
   actualModel?: string;
+  splitEnabled: boolean;
+  canAddPane: boolean;
   onModelChange: (model: string) => void;
   onDeliveryPreferenceChange: (preference: DeliveryPreference) => void;
+  onAddPane: () => void;
+  onToggleSplit: () => void;
   onOpenCanvas: () => void;
 }
 
@@ -36,8 +40,12 @@ export default function Toolbar({
   activeTool,
   thinkingLevel,
   actualModel,
+  splitEnabled,
+  canAddPane,
   onModelChange,
   onDeliveryPreferenceChange,
+  onAddPane,
+  onToggleSplit,
   onOpenCanvas,
 }: ToolbarProps) {
   const ctxClass = contextPct < 50 ? "low" : contextPct < 80 ? "med" : "high";
@@ -81,6 +89,25 @@ export default function Toolbar({
       <button className="toolbar-icon-button" onClick={onOpenCanvas} disabled={!agentAvailable} title="Ouvrir le Canvas OpenClaw">
         ◰
       </button>
+
+      <button
+        className={`toolbar-icon-button${splitEnabled ? " active" : ""}`}
+        onClick={onToggleSplit}
+        title={splitEnabled ? "Revenir à une conversation" : "Afficher deux conversations"}
+      >
+        {splitEnabled ? "▣" : "▥"}
+      </button>
+
+      {splitEnabled && (
+        <button
+          className="toolbar-icon-button"
+          onClick={onAddPane}
+          disabled={!canAddPane}
+          title="Ajouter une conversation"
+        >
+          +
+        </button>
+      )}
 
       <div className="toolbar-model">
         <select value={model} onChange={(e) => onModelChange(e.target.value)}>

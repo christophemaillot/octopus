@@ -1,4 +1,5 @@
 import { useState, useCallback, useRef, useEffect, useMemo } from "react";
+import type { MouseEvent as ReactMouseEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import Sidebar from "./components/Sidebar";
 import Toolbar from "./components/Toolbar";
@@ -7,10 +8,11 @@ import ChatPane from "./components/ChatPane";
 import { useHub } from "./hooks/useHub";
 import { useConfig } from "./hooks/useConfig";
 import { usePersistence } from "./hooks/usePersistence";
-import type { Thread, Message, ToolCall, RunState, SendMode, DeliveryPreference } from "./lib/types";
+import type { AgentInfo, Thread, Message, ToolCall, RunState, SendMode, DeliveryPreference } from "./lib/types";
 
 const DEFAULT_MODEL = "deepseek/deepseek-v4-flash";
 const SEND_DEBOUNCE_MS = 1500;
+const MAX_PANES = 3;
 
 interface PendingSend {
   id: string;
@@ -35,6 +37,12 @@ interface GatewayNotice {
   text: string;
 }
 
+interface ConversationPane {
+  id: string;
+  agentId: string | null;
+  threadId: string | null;
+}
+
 function hubHttpBase(wsUrl: string): string {
   try {
     const url = new URL(wsUrl || "wss://octopus.chrm.fr");
@@ -54,8 +62,12 @@ export default function App() {
     config?.hub ?? null,
   );
 
-  // Active agent
-  const [activeAgent, setActiveAgent] = useState<string | null>(null);
+  const [panes, setPanes] = useState<ConversationPane[]>([
+    { id: "pane-main", agentId: null, threadId: null },
+  ]);
+  const [activePaneId, setActivePaneId] = useState("pane-main");
+  const [paneSplitPct, setPaneSplitPct] = useState(50);
+  const [paneResizing, setPaneResizing] = useState(false);
 
   // Threads per agent: agentId → Thread[]
   const [threads, setThreads] = useState<Record<string, Thread[]>>({});
@@ -63,7 +75,6 @@ export default function App() {
   // Load/save threads via persistence hook
   const { loadThreads } = usePersistence(threads, setThreads);
   const [loaded, setLoaded] = useState(false);
-  const [activeThread, setActiveThread] = useState<string | null>(null);
 
   // Streaming state
   const [streamingContent, setStreamingContent] = useState<string | null>(null);
@@ -99,6 +110,16 @@ export default function App() {
   const previousAgentIdsRef = useRef<Set<string>>(new Set());
   const noticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastThreadByAgentRef = useRef<Record<string, string | null>>({});
+
+  const activePane = panes.find((pane) => pane.id === activePaneId) ?? panes[0];
+  const activeAgent = activePane?.agentId ?? null;
+  const activeThread = activePane?.threadId ?? null;
+
+  const updatePane = useCallback((paneId: string, patch: Partial<ConversationPane>) => {
+    setPanes((prev) => prev.map((pane) => (
+      pane.id === paneId ? { ...pane, ...patch } : pane
+    )));
+  }, []);
 
   const showGatewayNotice = useCallback((notice: Omit<GatewayNotice, "id">) => {
     if (noticeTimerRef.current) clearTimeout(noticeTimerRef.current);
@@ -153,10 +174,23 @@ export default function App() {
     }
   }, [loaded, agents, loadThreads]);
 
-  // Default to first agent
-  if (!activeAgent && agents.length > 0) {
-    setActiveAgent(agents[0].id);
-  }
+  useEffect(() => {
+    if (agents.length === 0) return;
+    setPanes((prev) => prev.map((pane, index) => {
+      const fallbackAgent = pane.agentId && agents.some((agent) => agent.id === pane.agentId)
+        ? pane.agentId
+        : (agents[index]?.id ?? agents[0].id);
+      const list = threads[fallbackAgent] ?? [];
+      const threadId = pane.threadId && list.some((thread) => thread.id === pane.threadId)
+        ? pane.threadId
+        : (list[list.length - 1]?.id ?? null);
+      return {
+        ...pane,
+        agentId: fallbackAgent,
+        threadId,
+      };
+    }));
+  }, [agents, threads]);
 
   const agentLabel =
     config?.agents.find((a) => a.id === activeAgent)?.label ??
@@ -205,7 +239,7 @@ export default function App() {
   }, [agentModel, currentThread?.contextPct, currentThread?.contextUsage, currentThread?.model, modelChoices]);
 
   // ── Create new thread ─────────────────────────────────────────────
-  const createThread = useCallback((agentId: string): Thread => {
+  const createThread = useCallback((agentId: string, paneId = activePaneId): Thread => {
     const thread: Thread = {
       id: crypto.randomUUID(),
       agentId,
@@ -217,9 +251,9 @@ export default function App() {
       ...prev,
       [agentId]: [...(prev[agentId] ?? []), thread],
     }));
-    setActiveThread(thread.id);
+    updatePane(paneId, { agentId, threadId: thread.id });
     return thread;
-  }, []);
+  }, [activePaneId, updatePane]);
 
   const flushPendingQueue = useCallback(() => {
     if (sendTimerRef.current) clearTimeout(sendTimerRef.current);
@@ -266,11 +300,20 @@ export default function App() {
   }, [armThinkingWatchdog, sendMessage]);
 
   // ── Debounced send ──────────────────────────────────────────────
-  const queueSend = useCallback((content: string) => {
-    if (!activeAgent) return;
+  const queueSend = useCallback((content: string, paneId = activePaneId) => {
+    const pane = panes.find((item) => item.id === paneId) ?? activePane;
+    const paneAgent = pane?.agentId ?? null;
+    if (!paneAgent) return;
 
-    const agentId = activeAgent;
-    const thread = currentThread ?? createThread(agentId);
+    const agentId = paneAgent;
+    const paneThreads = threads[agentId] ?? [];
+    const paneThread = paneThreads.find((thread) => thread.id === pane?.threadId) ?? null;
+    const thread = paneThread ?? createThread(agentId, paneId);
+    const paneModel =
+      selectedModels[agentId] ??
+      agents.find((agent) => agent.id === agentId)?.model ??
+      config?.agents.find((agent) => agent.id === agentId)?.model ??
+      DEFAULT_MODEL;
     const msgId = crypto.randomUUID();
 
     const userMsg: Message = {
@@ -286,7 +329,7 @@ export default function App() {
       agentId,
       threadId: thread.id,
       content,
-      model: agentModel,
+      model: paneModel,
       deliveryPreference,
     });
     setRunState("queued");
@@ -316,30 +359,32 @@ export default function App() {
       if (sendTimerRef.current) clearTimeout(sendTimerRef.current);
       sendTimerRef.current = setTimeout(flushPendingQueue, SEND_DEBOUNCE_MS);
     }
-  }, [activeAgent, currentThread, createThread, agentModel, deliveryPreference, flushPendingQueue, sendMode]);
+  }, [activePane, activePaneId, agents, config?.agents, createThread, deliveryPreference, flushPendingQueue, panes, selectedModels, sendMode, threads]);
 
   const notifyInputChange = useCallback(() => {}, []);
 
   const handleSend = useCallback(
-    (content: string, immediate = false) => {
+    (content: string, immediate = false, paneId = activePaneId) => {
       if (immediate) {
-        queueSend(content);
+        queueSend(content, paneId);
         setTimeout(flushPendingQueue, 0);
       } else {
-        queueSend(content);
+        queueSend(content, paneId);
       }
     },
-    [queueSend, flushPendingQueue],
+    [activePaneId, queueSend, flushPendingQueue],
   );
 
   // ── Cancel ──────────────────────────────────────────────────────
-  const handleCancel = useCallback(() => {
-    if (curMsgId.current && activeAgent) {
+  const handleCancel = useCallback((pane: ConversationPane = activePane) => {
+    const paneAgent = pane?.agentId ?? activeAgent;
+    const paneThread = pane?.threadId ?? activeThread;
+    if (curMsgId.current && paneAgent) {
       sendMessage({
         type: "cancel",
         id: curMsgId.current,
-        agent: activeAgent,
-        session: activeThread ?? undefined,
+        agent: paneAgent,
+        session: paneThread ?? undefined,
       });
     }
     setStreamingContent(null);
@@ -350,7 +395,7 @@ export default function App() {
     setRunState("idle");
     streamBufRef.current = "";
     clearThinkingWatchdog();
-  }, [activeAgent, activeThread, clearThinkingWatchdog, sendMessage]);
+  }, [activeAgent, activePane, activeThread, clearThinkingWatchdog, sendMessage]);
 
   // ── Select agent ─────────────────────────────────────────────────
   const handleSelectAgent = useCallback((id: string) => {
@@ -361,15 +406,14 @@ export default function App() {
       ? preferred
       : (list[list.length - 1]?.id ?? null);
 
-    setActiveAgent(id);
-    setActiveThread(nextThread);
+    updatePane(activePaneId, { agentId: id, threadId: nextThread });
     setStreamingContent(null);
     setIsThinking(false);
     setToolCalls([]);
     toolCallsRef.current = [];
     setActiveTool(null);
     setRunState("idle");
-  }, [activeAgent, activeThread, threads]);
+  }, [activeAgent, activePaneId, activeThread, threads, updatePane]);
 
   // ── Close thread ─────────────────────────────────────────────────
   const closeThread = useCallback((threadId: string) => {
@@ -418,7 +462,7 @@ export default function App() {
       const nextList = list.filter((t) => t.id !== threadId);
       if (activeThread === threadId) {
         const nextActive = nextList[Math.min(idx, nextList.length - 1)]?.id ?? null;
-        setActiveThread(nextActive);
+        updatePane(activePaneId, { threadId: nextActive });
       }
 
       return {
@@ -426,7 +470,7 @@ export default function App() {
         [activeAgent]: nextList,
       };
     });
-  }, [activeAgent, activeThread, sendMessage]);
+  }, [activeAgent, activePaneId, activeThread, sendMessage, updatePane]);
 
   const renameThread = useCallback((threadId: string, title: string) => {
     if (!activeAgent) return;
@@ -469,7 +513,7 @@ export default function App() {
         const list = threads[activeAgent ?? ""] ?? [];
         if (list.length === 0) return;
         const idx = list.findIndex((t) => t.id === activeThread);
-        if (idx > 0) setActiveThread(list[idx - 1].id);
+        if (idx > 0) updatePane(activePaneId, { threadId: list[idx - 1].id });
       }
 
       if (navMod && e.key === "ArrowRight") {
@@ -477,7 +521,7 @@ export default function App() {
         const list = threads[activeAgent ?? ""] ?? [];
         if (list.length === 0) return;
         const idx = list.findIndex((t) => t.id === activeThread);
-        if (idx < list.length - 1) setActiveThread(list[idx + 1].id);
+        if (idx < list.length - 1) updatePane(activePaneId, { threadId: list[idx + 1].id });
       }
 
       if (!isEditing && e.key === "n") {
@@ -490,7 +534,7 @@ export default function App() {
         if (activeThread) closeThread(activeThread);
       }
     },
-    [agents, activeAgent, activeThread, threads, createThread, closeThread, handleSelectAgent],
+    [agents, activeAgent, activePaneId, activeThread, threads, createThread, closeThread, handleSelectAgent, updatePane],
   );
 
   useEffect(() => {
@@ -599,9 +643,11 @@ export default function App() {
           [agentId]: (prev[agentId] ?? []).filter((t) => t.id !== threadId),
         }));
 
-        if (activeAgent === agentId && activeThread === threadId) {
-          setActiveThread(null);
-        }
+        setPanes((prev) => prev.map((pane) => (
+          pane.agentId === agentId && pane.threadId === threadId
+            ? { ...pane, threadId: null }
+            : pane
+        )));
         break;
       }
       case "send_message": {
@@ -850,7 +896,96 @@ export default function App() {
   }, [handleStreamMsg, onMessage]);
 
   // ── Split view ──────────────────────────────────────────────────
-  const [splitCount] = useState(1);
+  const splitEnabled = panes.length > 1;
+  const addPane = useCallback(() => {
+    if (panes.length >= MAX_PANES) return;
+    const nextPaneId = `pane-${crypto.randomUUID()}`;
+    setPanes((prev) => {
+      if (prev.length >= MAX_PANES) return prev;
+
+      const usedAgents = new Set(prev.map((pane) => pane.agentId).filter(Boolean));
+      const nextAgent = agents.find((agent) => !usedAgents.has(agent.id))?.id
+        ?? activeAgent
+        ?? agents[0]?.id
+        ?? null;
+      const nextThreads = nextAgent ? (threads[nextAgent] ?? []) : [];
+      const usedThreads = new Set(prev
+        .filter((pane) => pane.agentId === nextAgent)
+        .map((pane) => pane.threadId)
+        .filter(Boolean));
+      const nextThread = nextThreads.find((thread) => !usedThreads.has(thread.id))?.id
+        ?? nextThreads[nextThreads.length - 1]?.id
+        ?? null;
+
+      return [...prev, { id: nextPaneId, agentId: nextAgent, threadId: nextThread }];
+    });
+    setActivePaneId(nextPaneId);
+  }, [activeAgent, agents, panes.length, threads]);
+
+  const closePane = useCallback((paneId: string) => {
+    setPanes((prev) => {
+      if (prev.length <= 1) return prev;
+      const next = prev.filter((pane) => pane.id !== paneId);
+      if (!next.some((pane) => pane.id === activePaneId)) {
+        setActivePaneId(next[0]?.id ?? "pane-main");
+      }
+      return next;
+    });
+  }, [activePaneId]);
+
+  const toggleSplit = useCallback(() => {
+    if (panes.length === 1) {
+      addPane();
+      return;
+    }
+
+    setPanes((prev) => {
+      const kept = prev.find((pane) => pane.id === activePaneId) ?? prev[0];
+      setActivePaneId(kept.id);
+      return [kept];
+    });
+  }, [activePaneId, addPane, panes.length]);
+
+  const selectPaneAgent = useCallback((paneId: string, agentId: string) => {
+    const pane = panes.find((item) => item.id === paneId);
+    if (pane?.agentId) lastThreadByAgentRef.current[pane.agentId] = pane.threadId;
+    const list = threads[agentId] ?? [];
+    const preferred = lastThreadByAgentRef.current[agentId];
+    const nextThread = preferred && list.some((thread) => thread.id === preferred)
+      ? preferred
+      : (list[list.length - 1]?.id ?? null);
+    setActivePaneId(paneId);
+    updatePane(paneId, { agentId, threadId: nextThread });
+  }, [panes, threads, updatePane]);
+
+  const startPaneResize = useCallback((event: ReactMouseEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    const container = event.currentTarget.parentElement?.parentElement;
+    if (!container) return;
+
+    const rect = container.getBoundingClientRect();
+    setPaneResizing(true);
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+
+    const cleanup = () => {
+      setPaneResizing(false);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      window.removeEventListener("blur", cleanup);
+    };
+    const onMove = (moveEvent: MouseEvent) => {
+      const pct = ((moveEvent.clientX - rect.left) / rect.width) * 100;
+      setPaneSplitPct(Math.min(72, Math.max(28, pct)));
+    };
+    const onUp = () => cleanup();
+
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    window.addEventListener("blur", cleanup);
+  }, []);
 
   return (
     <div className="app">
@@ -883,8 +1018,12 @@ export default function App() {
           activeTool={activeTool}
           thinkingLevel={thinkingLevel}
           actualModel={actualModel}
+          splitEnabled={splitEnabled}
+          canAddPane={panes.length < MAX_PANES}
           onModelChange={handleModelChange}
           onDeliveryPreferenceChange={setDeliveryPreference}
+          onAddPane={addPane}
+          onToggleSplit={toggleSplit}
           onOpenCanvas={() => {
             if (!activeAgent) return;
             if (canvasPanel?.agentId === activeAgent) {
@@ -895,30 +1034,83 @@ export default function App() {
           }}
         />
 
-        <ThreadBar
-          threads={currentThreads}
-          activeThread={activeThread}
-          onSelect={setActiveThread}
-          onClose={closeThread}
-          onRename={renameThread}
-          onNew={() => activeAgent && createThread(activeAgent)}
-        />
+        {!splitEnabled && (
+          <ThreadBar
+            threads={currentThreads}
+            activeThread={activeThread}
+            onSelect={(threadId) => updatePane(activePaneId, { threadId })}
+            onClose={closeThread}
+            onRename={renameThread}
+            onNew={() => activeAgent && createThread(activeAgent)}
+          />
+        )}
 
         <div className="pane-grid">
-          {Array.from({ length: splitCount }).map((_, i) => (
-            <ChatPane
-              key={i}
-              thread={currentThread}
-              streamingContent={streamingContent}
-              isThinking={isThinking}
-              toolCalls={toolCalls}
-              activeUserMessageId={curMsgId.current ? `user-${curMsgId.current}` : null}
-              runState={runState}
-              onSend={handleSend}
-              onCancel={handleCancel}
-              onInputChange={notifyInputChange}
-            />
-          ))}
+          {panes.map((pane, index) => {
+            const paneThreads = threads[pane.agentId ?? ""] ?? [];
+            const paneThread = paneThreads.find((thread) => thread.id === pane.threadId) ?? null;
+            const isRunPane = curAgentRef.current === pane.agentId && curThreadRef.current === pane.threadId;
+            const paneStyle = panes.length === 2
+              ? { flexBasis: index === 0 ? `${paneSplitPct}%` : `${100 - paneSplitPct}%` }
+              : undefined;
+
+            return (
+              <div
+                key={pane.id}
+                className={`pane-frame${pane.id === activePaneId ? " active" : ""}`}
+                style={paneStyle}
+                onMouseDown={() => setActivePaneId(pane.id)}
+              >
+                {splitEnabled && (
+                  <PaneHeader
+                    pane={pane}
+                    active={pane.id === activePaneId}
+                    agents={agents}
+                    agentLabels={Object.fromEntries(
+                      (config?.agents ?? []).map((agent) => [agent.id, agent.label]),
+                    )}
+                    threads={paneThreads}
+                    thread={paneThread}
+                    paneCount={panes.length}
+                    canAddPane={panes.length < MAX_PANES}
+                    onSelectAgent={(agentId) => selectPaneAgent(pane.id, agentId)}
+                    onSelectThread={(threadId) => {
+                      setActivePaneId(pane.id);
+                      updatePane(pane.id, { threadId });
+                    }}
+                    onNewThread={() => {
+                      if (!pane.agentId) return;
+                      setActivePaneId(pane.id);
+                      createThread(pane.agentId, pane.id);
+                    }}
+                    onAddPane={addPane}
+                    onClosePane={() => closePane(pane.id)}
+                  />
+                )}
+                <ChatPane
+                  thread={paneThread}
+                  streamingContent={isRunPane ? streamingContent : null}
+                  isThinking={isRunPane && isThinking}
+                  toolCalls={isRunPane ? toolCalls : []}
+                  activeUserMessageId={isRunPane && curMsgId.current ? `user-${curMsgId.current}` : null}
+                  runState={isRunPane ? runState : "idle"}
+                  onSend={(content, immediate) => {
+                    setActivePaneId(pane.id);
+                    handleSend(content, immediate, pane.id);
+                  }}
+                  onCancel={() => {
+                    setActivePaneId(pane.id);
+                    handleCancel(pane);
+                  }}
+                  onInputChange={notifyInputChange}
+                />
+                {panes.length === 2 && index === 0 && (
+                  <div className="pane-divider" onMouseDown={startPaneResize} />
+                )}
+              </div>
+            );
+          })}
+          {paneResizing && <div className="pane-resize-overlay" />}
         </div>
       </div>
 
@@ -970,6 +1162,81 @@ export default function App() {
           />
         </aside>
       )}
+    </div>
+  );
+}
+
+interface PaneHeaderProps {
+  pane: ConversationPane;
+  active: boolean;
+  agents: AgentInfo[];
+  agentLabels: Record<string, string>;
+  threads: Thread[];
+  thread: Thread | null;
+  paneCount: number;
+  canAddPane: boolean;
+  onSelectAgent: (agentId: string) => void;
+  onSelectThread: (threadId: string | null) => void;
+  onNewThread: () => void;
+  onAddPane: () => void;
+  onClosePane: () => void;
+}
+
+function PaneHeader({
+  pane,
+  active,
+  agents,
+  agentLabels,
+  threads,
+  thread,
+  paneCount,
+  canAddPane,
+  onSelectAgent,
+  onSelectThread,
+  onNewThread,
+  onAddPane,
+  onClosePane,
+}: PaneHeaderProps) {
+  return (
+    <div className={`pane-header${active ? " active" : ""}`}>
+      <select
+        className="pane-header-select agent"
+        value={pane.agentId ?? ""}
+        onChange={(event) => onSelectAgent(event.target.value)}
+        title="Agent affiché dans cette colonne"
+      >
+        {!pane.agentId && <option value="">Agent</option>}
+        {agents.map((agent) => (
+          <option key={agent.id} value={agent.id}>
+            {agentLabels[agent.id] ?? agent.label}
+          </option>
+        ))}
+      </select>
+
+      <select
+        className="pane-header-select thread"
+        value={thread?.id ?? ""}
+        onChange={(event) => onSelectThread(event.target.value || null)}
+        disabled={!pane.agentId || threads.length === 0}
+        title="Conversation affichée dans cette colonne"
+      >
+        <option value="">{threads.length === 0 ? "Aucun thread" : "Thread"}</option>
+        {threads.map((item) => (
+          <option key={item.id} value={item.id}>
+            {item.title || "Nouveau"}
+          </option>
+        ))}
+      </select>
+
+      <button className="pane-header-button" onClick={onNewThread} disabled={!pane.agentId} title="Nouveau thread">
+        +
+      </button>
+      <button className="pane-header-button" onClick={onAddPane} disabled={!canAddPane} title="Ajouter une colonne">
+        ▥
+      </button>
+      <button className="pane-header-button" onClick={onClosePane} disabled={paneCount <= 1} title="Fermer cette colonne">
+        ×
+      </button>
     </div>
   );
 }
