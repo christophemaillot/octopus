@@ -81,7 +81,7 @@ export default function ChatPane({
         )}
 
         {messages.map((msg) => (
-          <div key={msg.id} className={`message-row ${msg.role}${msg.status === "pending" ? " pending" : ""}${msg.deliveryMode === "steer" ? " steer" : ""}`}>
+          <div key={msg.id} className={`message-row ${msg.role}${msg.status ? ` ${msg.status}` : ""}${msg.deliveryMode === "steer" ? " steer" : ""}`}>
             {!!msg.toolCalls?.length && (
               <details className="tool-panel compact">
                 <summary>tools · {msg.toolCalls.length}</summary>
@@ -91,9 +91,12 @@ export default function ChatPane({
               </details>
             )}
             {msg.content && (
-              <div className={`msg ${msg.role}${msg.status === "pending" ? " pending" : ""}${msg.deliveryMode === "steer" ? " steer" : ""}`}>
+              <div className={`msg ${msg.role}${msg.status ? ` ${msg.status}` : ""}${msg.deliveryMode === "steer" ? " steer" : ""}`}>
                 {msg.deliveryMode === "steer" && <div className="msg-mode-badge" title="Message injecté dans le run en cours">↪ orienter</div>}
                 <FormattedMessage content={msg.content} />
+                {msg.role === "user" && msg.status && msg.status !== "sent" && (
+                  <div className="msg-delivery-label">{deliveryLabel(msg.status)}</div>
+                )}
                 {msg.usage && (
                   <div className="msg-footer">
                     {msg.model && <span>{msg.model}</span>}
@@ -178,6 +181,21 @@ function ToolCallBadge({ call }: { call: ToolCall }) {
       {call.summary && <span style={{ color: "var(--text-dim)" }}>— {call.summary}</span>}
     </div>
   );
+}
+
+function deliveryLabel(status: string): string {
+  switch (status) {
+    case "pending":
+      return "en attente locale";
+    case "accepted":
+      return "accepté";
+    case "steered":
+      return "steer / pipeline";
+    case "queued_after_turn":
+      return "après le tour";
+    default:
+      return status;
+  }
 }
 
 function FormattedMessage({ content }: { content: string }) {

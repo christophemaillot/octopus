@@ -7,7 +7,7 @@ import ChatPane from "./components/ChatPane";
 import { useHub } from "./hooks/useHub";
 import { useConfig } from "./hooks/useConfig";
 import { usePersistence } from "./hooks/usePersistence";
-import type { Thread, Message, ToolCall, RunState, SendMode } from "./lib/types";
+import type { Thread, Message, ToolCall, RunState, SendMode, DeliveryPreference } from "./lib/types";
 
 const DEFAULT_MODEL = "deepseek/deepseek-v4-flash";
 const SEND_DEBOUNCE_MS = 1500;
@@ -18,6 +18,7 @@ interface PendingSend {
   threadId: string;
   content: string;
   model: string;
+  deliveryPreference: DeliveryPreference;
 }
 
 interface CanvasPanelState {
@@ -72,6 +73,7 @@ export default function App() {
   const [replayStateLoaded, setReplayStateLoaded] = useState(false);
   const [runState, setRunState] = useState<RunState>("idle");
   const [sendMode, setSendMode] = useState<SendMode>("queue");
+  const [deliveryPreference, setDeliveryPreference] = useState<DeliveryPreference>("steer");
   const [pendingCount, setPendingCount] = useState(0);
   const [activeTool, setActiveTool] = useState<string | null>(null);
   const [actualModels, setActualModels] = useState<Record<string, string>>({});
@@ -237,34 +239,21 @@ export default function App() {
     for (const items of groups.values()) {
       const last = items[items.length - 1];
       const content = items.map((item) => item.content).join("\n\n");
+      const attachToCurrentRun = !curMsgId.current;
 
-      curMsgId.current = last.id;
-      curAgentRef.current = last.agentId;
-      curThreadRef.current = last.threadId;
-      setStreamingContent(null);
-      setIsThinking(true);
-      setToolCalls([]);
-      toolCallsRef.current = [];
-      setActiveTool(null);
-      setRunState("thinking");
-      streamBufRef.current = "";
-      armThinkingWatchdog();
-
-      setThreads((prev) => ({
-        ...prev,
-        [last.agentId]: (prev[last.agentId] ?? []).map((t) =>
-          t.id === last.threadId
-            ? {
-                ...t,
-                messages: t.messages.map((msg) =>
-                  items.some((item) => msg.id === `user-${item.id}`)
-                    ? { ...msg, status: "sent", deliveryMode: "turn" }
-                    : msg,
-                ),
-              }
-            : t,
-        ),
-      }));
+      if (attachToCurrentRun) {
+        curMsgId.current = last.id;
+        curAgentRef.current = last.agentId;
+        curThreadRef.current = last.threadId;
+        setStreamingContent(null);
+        setIsThinking(true);
+        setToolCalls([]);
+        toolCallsRef.current = [];
+        setActiveTool(null);
+        setRunState("thinking");
+        streamBufRef.current = "";
+        armThinkingWatchdog();
+      }
 
       sendMessage({
         type: "send_message",
@@ -273,6 +262,7 @@ export default function App() {
         session: last.threadId,
         content,
         model: last.model,
+        deliveryPreference: last.deliveryPreference,
       });
     }
   }, [armThinkingWatchdog, sendMessage]);
@@ -299,6 +289,7 @@ export default function App() {
       threadId: thread.id,
       content,
       model: agentModel,
+      deliveryPreference,
     });
     setPendingCount(pendingQueueRef.current.length);
     setRunState("queued");
@@ -328,7 +319,7 @@ export default function App() {
       if (sendTimerRef.current) clearTimeout(sendTimerRef.current);
       sendTimerRef.current = setTimeout(flushPendingQueue, SEND_DEBOUNCE_MS);
     }
-  }, [activeAgent, currentThread, createThread, agentModel, flushPendingQueue, sendMode]);
+  }, [activeAgent, currentThread, createThread, agentModel, deliveryPreference, flushPendingQueue, sendMode]);
 
   const notifyInputChange = useCallback(() => {}, []);
 
@@ -690,22 +681,48 @@ export default function App() {
         break;
       }
       case "message_delivery": {
-        if (!msg.id || !msg.agent || !msg.session) break;
+        const agentId = msg.agent;
+        const threadId = msg.session;
+        if (!agentId || !threadId || !msg.id) break;
+
+        const status: Message["status"] =
+          msg.status === "accepted"
+            ? "accepted"
+            : msg.status === "queued_after_turn"
+              ? "queued_after_turn"
+              : msg.status === "steered_or_queued" || msg.status === "steered" || msg.deliveryMode === "steer"
+                ? "steered"
+                : msg.status === "started_turn"
+                  ? "sent"
+                  : "accepted";
+        const deliveryMode: Message["deliveryMode"] =
+          status === "steered" ? "steer" : msg.deliveryMode === "turn" ? "turn" : undefined;
+
         setThreads((prev) => ({
           ...prev,
-          [msg.agent!]: (prev[msg.agent!] ?? []).map((t) =>
-            t.id === msg.session
+          [agentId]: (prev[agentId] ?? []).map((t) =>
+            t.id === threadId
               ? {
                   ...t,
-                  messages: t.messages.map((m) =>
-                    m.id === `user-${msg.id}`
-                      ? { ...m, status: "sent", deliveryMode: msg.deliveryMode === "steer" ? "steer" : "turn" }
-                      : m,
+                  messages: t.messages.map((message) =>
+                    message.id === `user-${msg.id}` ? { ...message, status, deliveryMode } : message,
                   ),
                 }
               : t,
           ),
         }));
+
+        if (
+          msg.id === curMsgId.current &&
+          (msg.status === "queued_after_turn" || msg.status === "steered_or_queued")
+        ) {
+          setIsThinking(false);
+          setRunState("idle");
+          clearThinkingWatchdog();
+          curMsgId.current = null;
+          curAgentRef.current = null;
+          curThreadRef.current = null;
+        }
         break;
       }
       case "agent_status":
@@ -793,8 +810,11 @@ export default function App() {
                   contextUsage: msg.usage ?? t.contextUsage,
                   model: msg.model ?? t.model,
                 };
-                if (t.messages.some((m) => m.id === assMsg.id)) return base;
-                return { ...base, messages: [...t.messages, assMsg] };
+                const messages = t.messages.map((message) =>
+                  message.id === `user-${msg.id}` ? { ...message, status: "sent" as const } : message,
+                );
+                if (messages.some((m) => m.id === assMsg.id)) return { ...base, messages };
+                return { ...base, messages: [...messages, assMsg] };
               }),
             };
           });
@@ -864,12 +884,14 @@ export default function App() {
           agentAvailable={agentAvailable}
           runState={runState}
           sendMode={sendMode}
+          deliveryPreference={deliveryPreference}
           pendingCount={pendingCount}
           activeTool={activeTool}
           thinkingLevel={thinkingLevel}
           actualModel={actualModel}
           onModelChange={handleModelChange}
           onSendModeChange={setSendMode}
+          onDeliveryPreferenceChange={setDeliveryPreference}
           onOpenCanvas={() => {
             if (!activeAgent) return;
             if (canvasPanel?.agentId === activeAgent) {

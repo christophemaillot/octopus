@@ -105,6 +105,12 @@ struct WsMessage {
     body_base64: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     replace: Option<bool>,
+    #[serde(
+        default,
+        rename = "deliveryPreference",
+        skip_serializing_if = "Option::is_none"
+    )]
+    delivery_preference: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -572,7 +578,12 @@ async fn route_message(msg: WsMessage, sender_id: &str, state: &Arc<AppState>) {
                         .send(Message::Text(serde_json::to_string(&msg).unwrap()));
                 }
                 drop(peers);
-                if matches!(msg.msg_type.as_str(), "done" | "error") {
+                let terminal_delivery = msg.msg_type == "message_delivery"
+                    && matches!(
+                        msg.status.as_deref(),
+                        Some("queued_after_turn" | "steered_or_queued" | "accepted_by_pipeline")
+                    );
+                if matches!(msg.msg_type.as_str(), "done" | "error") || terminal_delivery {
                     if let Some(message_id) = &msg.id {
                         let mut pending = state.pending_requests.lock().await;
                         pending.remove(message_id);
@@ -846,7 +857,7 @@ fn empty_message() -> WsMessage {
         summary: None, code: None, message: None, usage: None, seq: None, since: None,
         ack_seq: None, sessions: None, method: None, path: None, title: None, url: None,
         status_code: None, headers: None, body_base64: None,
-        replace: None,
+        replace: None, delivery_preference: None,
     }
 }
 
@@ -979,7 +990,7 @@ async fn compact_events(state: &Arc<AppState>) -> anyhow::Result<()> {
 
             if matches!(
                 event.message.msg_type.as_str(),
-                "chunk" | "tool_progress" | "agent_status"
+                "chunk" | "tool_progress" | "agent_status" | "message_delivery"
             ) {
                 if let Some(id) = &event.message.id {
                     return !completed_messages.contains(id);

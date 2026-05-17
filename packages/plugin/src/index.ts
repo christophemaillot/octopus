@@ -1,12 +1,15 @@
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
+import {
+  dispatchReplyWithBufferedBlockDispatcher,
+  finalizeInboundContext,
+} from "openclaw/plugin-sdk/reply-dispatch-runtime";
 import { createPluginRuntimeStore } from "openclaw/plugin-sdk/runtime-store";
 import type { PluginRuntime } from "openclaw/plugin-sdk/runtime-store";
 import WebSocket from "ws";
 import { randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import path from "node:path";
-import { isEmbeddedAgentRunActive, queueEmbeddedAgentMessage } from "openclaw/plugin-sdk/agents/pi-embedded";
 
 let GLOBAL_LOCK = false;
 
@@ -30,6 +33,8 @@ interface AgentInfo {
   agentDir: string;
   models: ModelInfo[];
 }
+
+type DeliveryPreference = "steer" | "queue_after_turn";
 
 function parseFirstJson(raw: string): any {
   const trimmed = raw.trim();
@@ -110,49 +115,54 @@ function resolvePrimaryModel(config: any): { provider?: string; model?: string; 
   return { model: id, id };
 }
 
-function resultText(result: any): string {
-  const payloadText = Array.isArray(result?.payloads)
-    ? result.payloads.map((p: any) => p?.text || "").filter(Boolean).join("\n\n")
-    : "";
-  return payloadText
-    || result?.meta?.finalAssistantVisibleText
-    || result?.meta?.finalAssistantRawText
-    || "";
-}
-
 function splitModelId(id: string): { provider?: string; model?: string; id: string } {
   const slash = id.indexOf("/");
   if (slash > 0) return { provider: id.slice(0, slash), model: id.slice(slash + 1), id };
   return { model: id, id };
 }
 
-function resultModelId(result: any, fallback: string): string {
-  const meta = result?.meta?.agentMeta;
-  if (meta?.provider && meta?.model) return `${meta.provider}/${meta.model}`;
-  return meta?.model || fallback;
+function normalizeDeliveryPreference(value: unknown): DeliveryPreference | undefined {
+  if (value === "steer" || value === "queue_after_turn") return value;
+  if (value === "queue" || value === "followup") return "queue_after_turn";
+  return undefined;
 }
 
-function resultUsage(result: any): {
-  input_tokens: number;
-  output_tokens: number;
-  context_pct: number;
-  prompt_tokens?: number;
-  context_tokens?: number;
-} {
-  const meta = result?.meta?.agentMeta ?? {};
-  const usage = meta.usage ?? {};
-  const lastCallUsage = meta.lastCallUsage ?? {};
-  const input = usage.input ?? lastCallUsage.input ?? 0;
-  const output = usage.output ?? lastCallUsage.output ?? 0;
-  const promptTokens = meta.promptTokens ?? usage.total ?? lastCallUsage.total ?? lastCallUsage.input ?? input;
-  const contextTokens = meta.contextTokens ?? 0;
-  return {
-    input_tokens: input,
-    output_tokens: output,
-    prompt_tokens: promptTokens,
-    context_tokens: contextTokens,
-    context_pct: contextTokens > 0 ? Math.min(100, Math.round((promptTokens / contextTokens) * 1000) / 10) : 0,
-  };
+function deliveryQueueDirective(preference: DeliveryPreference | undefined): string | undefined {
+  if (preference === "steer") return "/queue steer";
+  if (preference === "queue_after_turn") return "/queue followup";
+  return undefined;
+}
+
+function commandBodyWithDirectives(
+  content: string,
+  modelId: string | undefined,
+  preference: DeliveryPreference | undefined,
+): string {
+  const directive = deliveryQueueDirective(preference);
+  return [
+    modelId ? `/model ${modelId}` : undefined,
+    directive,
+    content,
+  ].filter(Boolean).join("\n");
+}
+
+function safeSessionToken(value: unknown, fallback: string): string {
+  const raw = String(value ?? "").trim().toLowerCase();
+  return raw
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80) || fallback;
+}
+
+function buildOctopusSessionKey(agentId: string, clientSession: string): string {
+  return [
+    "agent",
+    safeSessionToken(agentId, "main"),
+    "octopus",
+    "desktop",
+    "direct",
+    safeSessionToken(clientSession, "unknown"),
+  ].join(":");
 }
 
 function canvasPath(pathname: string): string {
@@ -353,36 +363,22 @@ export default definePluginEntry({
 
         if (msg.type !== "send_message") return;
 
+        processing = true;
         try {
           const msgId = msg.id || randomUUID();
           const agentId = msg.agent || "main";
           const agent = octopusAgents.find((a) => a.id === agentId) ?? octopusAgents[0];
           if (!agent) throw new Error(`agent '${agentId}' is not configured`);
           const selectedModel = splitModelId(String(msg.model || agent.model));
-          const sessionId = `octopus:${agentId}:${msg.session || randomUUID()}`;
-          const clientSession = String(msg.session || sessionId);
-          if (isEmbeddedAgentRunActive(sessionId)) {
-            const queued = queueEmbeddedAgentMessage(sessionId, msg.content || "", {
-              steeringMode: "all",
-              debounceMs: 250,
-            });
-            send({
-              type: "message_delivery",
-              id: msgId,
-              agent: agentId,
-              session: clientSession,
-              deliveryMode: queued ? "steer" : "turn",
-              status: queued ? "steered" : "queued",
-            });
-            if (queued) return;
-          }
-
-          processing = true;
+          const content = String(msg.content || "");
+          const clientSession = String(msg.session || randomUUID());
+          const deliveryPreference = normalizeDeliveryPreference(msg.deliveryPreference);
+          const sessionKey = buildOctopusSessionKey(agentId, clientSession);
           const runId = randomUUID();
           currentMsgId = msgId;
           currentAgentId = agentId;
           currentSession = clientSession;
-          currentRunId = runId;
+          currentRunId = null;
           currentStreamText = "";
           sawAgentToolEvent = false;
 
@@ -391,10 +387,9 @@ export default definePluginEntry({
             id: msgId,
             agent: agentId,
             session: clientSession,
-            deliveryMode: "turn",
-            status: "running",
+            status: "accepted",
+            code: deliveryPreference ?? "configured",
           });
-
           send({
             type: "agent_status",
             id: msgId,
@@ -404,35 +399,166 @@ export default definePluginEntry({
             model: selectedModel.id,
           });
 
-          const sessionsDir = path.join(agent.agentDir, "sessions");
-          mkdirSync(sessionsDir, { recursive: true });
-          const result = await api.runtime.agent.runEmbeddedAgent({
-            sessionId,
-            agentId,
-            runId,
-            sessionFile: path.join(sessionsDir, sessionId.replace(/:/g, "-") + ".jsonl"),
-            workspaceDir: agent.workspaceDir,
-            agentDir: agent.agentDir,
-            prompt: msg.content || "",
-            provider: selectedModel.provider,
-            model: selectedModel.model,
-            timeoutMs: api.runtime.agent.resolveAgentTimeoutMs(api.config),
-            onAssistantMessageStart: () => {
-              send({ type: "agent_status", id: msgId, agent: agentId, session: clientSession, status: "streaming", model: selectedModel.id });
+          let actualModel = selectedModel.id;
+          let runStarted = false;
+          let replyDelivered = false;
+          let streamText = "";
+          const sendLocalAssistantChunk = (data: any) => {
+            const fullText = typeof data?.text === "string" ? data.text : "";
+            const delta = typeof data?.delta === "string" ? data.delta : "";
+            const replace = Boolean(data?.replace);
+            if (!fullText && !delta) return;
+
+            if (replace && fullText) {
+              streamText = fullText;
+              if (currentMsgId === msgId) currentStreamText = streamText;
+              send({ type: "chunk", id: msgId, agent: agentId, session: clientSession, content: fullText, replace: true });
+              return;
+            }
+
+            if (delta) {
+              streamText += delta;
+              if (currentMsgId === msgId) currentStreamText = streamText;
+              send({ type: "chunk", id: msgId, agent: agentId, session: clientSession, content: delta });
+              return;
+            }
+
+            if (fullText === streamText) return;
+            const append = fullText.startsWith(streamText);
+            const chunk = append ? fullText.slice(streamText.length) : fullText;
+            streamText = fullText;
+            if (currentMsgId === msgId) currentStreamText = streamText;
+            send({ type: "chunk", id: msgId, agent: agentId, session: clientSession, content: chunk, replace: !append });
+          };
+          const ctxPayload = finalizeInboundContext({
+            Body: content,
+            BodyForAgent: content,
+            RawBody: content,
+            CommandBody: commandBodyWithDirectives(content, selectedModel.id, deliveryPreference),
+            From: `octopus:${clientSession}`,
+            To: `octopus:${agentId}`,
+            SessionKey: sessionKey,
+            AccountId: "desktop",
+            ChatType: "direct",
+            ConversationLabel: "Octopus Desktop",
+            NativeChannelId: clientSession,
+            MessageThreadId: clientSession,
+            SenderName: "Octopus Desktop",
+            SenderId: "octopus-desktop",
+            Provider: "octopus",
+            Surface: "octopus",
+            MessageSid: msgId,
+            MessageSidFull: msgId,
+            Timestamp: Date.now(),
+            OriginatingChannel: "octopus",
+            OriginatingTo: `octopus:${agentId}`,
+            CommandAuthorized: true,
+          });
+
+          const result = await dispatchReplyWithBufferedBlockDispatcher({
+            ctx: ctxPayload,
+            cfg: api.config as any,
+            dispatcherOptions: {
+              deliver: async (payload: any, info: any) => {
+                const text = typeof payload?.text === "string" ? payload.text : "";
+                if (!text.trim()) return;
+                replyDelivered = true;
+                if (info?.kind === "tool") {
+                  sendToolProgress(agentId, clientSession, msgId, {
+                    name: "tool",
+                    phase: "result",
+                    result: text,
+                  });
+                  return;
+                }
+                sendLocalAssistantChunk({ text, replace: true });
+              },
+              onReplyStart: () => {
+                send({
+                  type: "agent_status",
+                  id: msgId,
+                  agent: agentId,
+                  session: clientSession,
+                  status: "streaming",
+                  model: actualModel,
+                });
+              },
+              onError: (err: unknown) => {
+                api.logger.warn(`octopus: reply delivery failed: ${err instanceof Error ? err.message : String(err)}`);
+              },
             },
-            onAgentEvent: (evt: any) => {
-              if (evt?.stream === "assistant") sendAssistantChunk(agentId, clientSession, msgId, evt.data);
-              if (evt?.stream === "tool") sendToolProgress(agentId, clientSession, msgId, evt.data);
-              if (evt?.stream === "command_output") sendToolProgress(agentId, clientSession, msgId, { ...evt.data, phase: "update" });
+            replyOptions: {
+              runId,
+              onAgentRunStart: (startedRunId: string) => {
+                runStarted = true;
+                currentRunId = startedRunId;
+                send({
+                  type: "message_delivery",
+                  id: msgId,
+                  agent: agentId,
+                  session: clientSession,
+                  status: "started_turn",
+                  code: deliveryPreference ?? "configured",
+                });
+              },
+              onAssistantMessageStart: () => {
+                send({
+                  type: "agent_status",
+                  id: msgId,
+                  agent: agentId,
+                  session: clientSession,
+                  status: "streaming",
+                  model: actualModel,
+                });
+              },
+              onPartialReply: (payload: any) => {
+                sendLocalAssistantChunk(payload);
+              },
+              onModelSelected: (ctx: any) => {
+                if (ctx?.provider && ctx?.model) actualModel = `${ctx.provider}/${ctx.model}`;
+                else if (ctx?.model) actualModel = String(ctx.model);
+                send({
+                  type: "agent_status",
+                  id: msgId,
+                  agent: agentId,
+                  session: clientSession,
+                  status: "thinking",
+                  model: actualModel,
+                });
+              },
+              onToolStart: (payload: any) => sendToolProgress(agentId, clientSession, msgId, payload),
+              onItemEvent: (payload: any) => sendToolProgress(agentId, clientSession, msgId, payload),
+              onCommandOutput: (payload: any) => sendToolProgress(agentId, clientSession, msgId, payload),
+              onPatchSummary: (payload: any) => sendToolProgress(agentId, clientSession, msgId, payload),
             },
           });
 
-          send({
-            type: "done", id: msgId, agent: agentId, session: clientSession,
-            content: resultText(result),
-            usage: resultUsage(result),
-            model: resultModelId(result, selectedModel.id),
-          });
+          if (!runStarted && !replyDelivered) {
+            const status = result?.queuedFinal
+              ? "queued_after_turn"
+              : deliveryPreference === "steer"
+                ? "steered_or_queued"
+                : "accepted_by_pipeline";
+            send({
+              type: "message_delivery",
+              id: msgId,
+              agent: agentId,
+              session: clientSession,
+              status,
+              code: deliveryPreference ?? "configured",
+            });
+          }
+
+          if (runStarted || replyDelivered) {
+            send({
+              type: "done",
+              id: msgId,
+              agent: agentId,
+              session: clientSession,
+              content: streamText,
+              model: actualModel,
+            });
+          }
         } catch (e: any) {
           api.logger.error(`octopus: ${e.message}`);
           send({ type: "error", id: currentMsgId, agent: currentAgentId, session: currentSession, code: "agent_error", message: e.message });
@@ -453,7 +579,7 @@ export default definePluginEntry({
 
     api.on("llm_output", async (event) => {
       if (!processing) return;
-      if (currentRunId && event.runId && event.runId !== currentRunId) return;
+      if (!currentRunId || event.runId !== currentRunId) return;
       try {
         const fullText = Array.isArray((event as any).assistantTexts)
           ? (event as any).assistantTexts.filter(Boolean).join("\n\n")
@@ -469,7 +595,7 @@ export default definePluginEntry({
 
     api.on("before_tool_call", async (event) => {
       if (!processing) return;
-      if (currentRunId && event.runId && event.runId !== currentRunId) return;
+      if (!currentRunId || event.runId !== currentRunId) return;
       if (sawAgentToolEvent) return;
       try {
         if (!event.error && String(event.toolName || "").startsWith("canvas")) {
@@ -495,7 +621,7 @@ export default definePluginEntry({
 
     api.on("after_tool_call", async (event) => {
       if (!processing) return;
-      if (currentRunId && event.runId && event.runId !== currentRunId) return;
+      if (!currentRunId || event.runId !== currentRunId) return;
       if (sawAgentToolEvent) return;
       try {
         send({

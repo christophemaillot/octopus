@@ -47,6 +47,7 @@ export interface HubMessage {
   headers?: Record<string, string>;
   bodyBase64?: string;
   replace?: boolean;
+  deliveryPreference?: DeliveryPreference;
 }
 
 export interface ReplaySession {
@@ -78,7 +79,7 @@ export interface Message {
   id: string;
   role: "user" | "assistant" | "system";
   content: string;
-  status?: "pending" | "sent";
+  status?: "pending" | "accepted" | "sent" | "steered" | "queued_after_turn";
   deliveryMode?: "turn" | "steer";
   toolCalls?: ToolCall[];
   usage?: UsageInfo;
@@ -101,3 +102,4 @@ export interface Pane {
 export type AgentStatus = "idle" | "thinking" | "streaming" | "error";
 export type RunState = "idle" | "queued" | "thinking" | "streaming" | "tool" | "error";
 export type SendMode = "queue" | "instant";
+export type DeliveryPreference = "steer" | "queue_after_turn";

@@ -1,4 +1,4 @@
-import type { ModelInfo, RunState, SendMode } from "../lib/types";
+import type { DeliveryPreference, ModelInfo, RunState, SendMode } from "../lib/types";
 
 interface ToolbarProps {
   connected: boolean;
@@ -9,12 +9,14 @@ interface ToolbarProps {
   agentAvailable: boolean;
   runState: RunState;
   sendMode: SendMode;
+  deliveryPreference: DeliveryPreference;
   pendingCount: number;
   activeTool: string | null;
   thinkingLevel?: string;
   actualModel?: string;
   onModelChange: (model: string) => void;
   onSendModeChange: (mode: SendMode) => void;
+  onDeliveryPreferenceChange: (preference: DeliveryPreference) => void;
   onOpenCanvas: () => void;
 }
 
@@ -34,12 +36,14 @@ export default function Toolbar({
   agentAvailable,
   runState,
   sendMode,
+  deliveryPreference,
   pendingCount,
   activeTool,
   thinkingLevel,
   actualModel,
   onModelChange,
   onSendModeChange,
+  onDeliveryPreferenceChange,
   onOpenCanvas,
 }: ToolbarProps) {
   const ctxClass = contextPct < 50 ? "low" : contextPct < 80 ? "med" : "high";
@@ -74,6 +78,16 @@ export default function Toolbar({
         <select value={sendMode} onChange={(e) => onSendModeChange(e.target.value as SendMode)}>
           <option value="queue">queue{pendingCount > 0 ? ` (${pendingCount})` : ""}</option>
           <option value="instant">instant</option>
+        </select>
+      </div>
+
+      <div className="toolbar-delivery-mode" title="Préférence pendant un tour agent actif">
+        <select
+          value={deliveryPreference}
+          onChange={(e) => onDeliveryPreferenceChange(e.target.value as DeliveryPreference)}
+        >
+          <option value="steer">steer</option>
+          <option value="queue_after_turn">after turn</option>
         </select>
       </div>
 
