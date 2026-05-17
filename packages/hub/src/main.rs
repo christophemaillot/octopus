@@ -581,7 +581,7 @@ async fn route_message(msg: WsMessage, sender_id: &str, state: &Arc<AppState>) {
                 let terminal_delivery = msg.msg_type == "message_delivery"
                     && matches!(
                         msg.status.as_deref(),
-                        Some("queued_after_turn" | "steered_or_queued" | "accepted_by_pipeline")
+                        Some("queued_after_turn" | "steered" | "steered_or_queued" | "accepted_by_pipeline")
                     );
                 if matches!(msg.msg_type.as_str(), "done" | "error") || terminal_delivery {
                     if let Some(message_id) = &msg.id {

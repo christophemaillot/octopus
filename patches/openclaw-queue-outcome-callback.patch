@@ -1,0 +1,238 @@
+diff --git a/src/auto-reply/get-reply-options.types.ts b/src/auto-reply/get-reply-options.types.ts
+index 0a95f9fbd3..629f704a41 100644
+--- a/src/auto-reply/get-reply-options.types.ts
++++ b/src/auto-reply/get-reply-options.types.ts
+@@ -45,6 +45,20 @@ export type PartialReplyPayload = Pick<ReplyPayload, "text" | "mediaUrls"> & {
+   replace?: true;
+ };
+ 
++export type ReplyQueueOutcome = {
++  status: "steered" | "queued_after_turn" | "rejected" | "dropped";
++  mode: "steer" | "followup" | "drop";
++  queueMode?: string;
++  queued: boolean;
++  sessionId?: string;
++  target?: string;
++  gatewayHealth?: string;
++  reason?: string;
++  errorMessage?: string;
++  enqueuedAtMs?: number;
++  deliveredAtMs?: number;
++};
++
+ export type GetReplyOptions = {
+   /** Override run id for agent events (defaults to random UUID). */
+   runId?: string;
+@@ -56,6 +70,8 @@ export type GetReplyOptions = {
+   imageOrder?: PromptImageOrderEntry[];
+   /** Notifies when an agent run actually starts (useful for webchat command handling). */
+   onAgentRunStart?: (runId: string) => void;
++  /** Notifies channels when an inbound message is steered into an active turn or queued behind it. */
++  onQueueOutcome?: (outcome: ReplyQueueOutcome) => Promise<void> | void;
+   onReplyStart?: () => Promise<void> | void;
+   /** Called when the typing controller cleans up (e.g., run ended with NO_REPLY). */
+   onTypingCleanup?: () => void;
+diff --git a/src/auto-reply/reply/agent-runner.media-paths.test.ts b/src/auto-reply/reply/agent-runner.media-paths.test.ts
+index 05c414f39b..0650dda7f7 100644
+--- a/src/auto-reply/reply/agent-runner.media-paths.test.ts
++++ b/src/auto-reply/reply/agent-runner.media-paths.test.ts
+@@ -224,11 +224,14 @@ describe("runReplyAgent media path normalization", () => {
+   });
+ 
+   it("steers active prompts in steer queue mode", async () => {
++    const onQueueOutcome = vi.fn();
+     queueEmbeddedPiMessageWithOutcomeAsyncMock.mockImplementation(async (sessionId: string) => ({
+       queued: true,
+       sessionId,
+       target: "embedded_run",
+       gatewayHealth: "live",
++      enqueuedAtMs: 123,
++      deliveredAtMs: 456,
+     }));
+ 
+     await runReplyAgent(
+@@ -237,6 +240,7 @@ describe("runReplyAgent media path normalization", () => {
+         shouldSteer: true,
+         shouldFollowup: true,
+         isStreaming: true,
++        opts: { onQueueOutcome },
+       }),
+     );
+ 
+@@ -248,9 +252,21 @@ describe("runReplyAgent media path normalization", () => {
+       },
+     );
+     expect(enqueueFollowupRunMock).not.toHaveBeenCalled();
++    expect(onQueueOutcome).toHaveBeenCalledWith({
++      status: "steered",
++      mode: "steer",
++      queueMode: "steer",
++      queued: true,
++      sessionId: "session",
++      target: "embedded_run",
++      gatewayHealth: "live",
++      enqueuedAtMs: 123,
++      deliveredAtMs: 456,
++    });
+   });
+ 
+   it("queues active prompts in followup mode without steering", async () => {
++    const onQueueOutcome = vi.fn();
+     await runReplyAgent(
+       makeRunReplyAgentParams({
+         resolvedQueue: { mode: "followup" } as QueueSettings,
+@@ -259,15 +275,26 @@ describe("runReplyAgent media path normalization", () => {
+         isActive: true,
+         isRunActive: () => true,
+         isStreaming: true,
++        opts: { onQueueOutcome },
+       }),
+     );
+ 
+     expect(queueEmbeddedPiMessageWithOutcomeAsyncMock).not.toHaveBeenCalled();
+     expect(enqueueFollowupRunMock).toHaveBeenCalledOnce();
+     expect(enqueueFollowupRunMock.mock.calls[0]?.[1].prompt).toBe("generate chart");
++    expect(onQueueOutcome).toHaveBeenCalledWith({
++      status: "queued_after_turn",
++      mode: "followup",
++      queueMode: "followup",
++      queued: true,
++      sessionId: "session",
++      target: "followup_queue",
++      enqueuedAtMs: expect.any(Number),
++    });
+   });
+ 
+   it("falls back to a queued followup when active steering is rejected", async () => {
++    const onQueueOutcome = vi.fn();
+     queueEmbeddedPiMessageWithOutcomeAsyncMock.mockImplementation(async (sessionId: string) => ({
+       queued: false,
+       sessionId,
+@@ -284,11 +311,31 @@ describe("runReplyAgent media path normalization", () => {
+         isActive: true,
+         isRunActive: () => true,
+         isStreaming: true,
++        opts: { onQueueOutcome },
+       }),
+     );
+ 
+     expect(enqueueFollowupRunMock).toHaveBeenCalledOnce();
+     expect(enqueueFollowupRunMock.mock.calls[0]?.[1].prompt).toBe("generate chart");
++    expect(onQueueOutcome).toHaveBeenNthCalledWith(1, {
++      status: "rejected",
++      mode: "steer",
++      queueMode: "steer",
++      queued: false,
++      sessionId: "session",
++      gatewayHealth: "live",
++      reason: "runtime_rejected",
++      errorMessage: "cannot steer a compact turn",
++    });
++    expect(onQueueOutcome).toHaveBeenNthCalledWith(2, {
++      status: "queued_after_turn",
++      mode: "followup",
++      queueMode: "steer",
++      queued: true,
++      sessionId: "session",
++      target: "followup_queue",
++      enqueuedAtMs: expect.any(Number),
++    });
+   });
+ 
+   it("shares one media cache between block accumulation and final payload delivery", async () => {
+diff --git a/src/auto-reply/reply/agent-runner.ts b/src/auto-reply/reply/agent-runner.ts
+index 27d3b953c2..318f2ecaf3 100644
+--- a/src/auto-reply/reply/agent-runner.ts
++++ b/src/auto-reply/reply/agent-runner.ts
+@@ -1138,6 +1138,16 @@ export async function runReplyAgent(params: {
+ 
+   const pendingToolTasks = new Set<Promise<void>>();
+   const blockReplyTimeoutMs = opts?.blockReplyTimeoutMs ?? BLOCK_REPLY_SEND_TIMEOUT_MS;
++  const notifyQueueOutcome = async (
++    outcome: Parameters<NonNullable<GetReplyOptions["onQueueOutcome"]>>[0],
++  ) => {
++    try {
++      await opts?.onQueueOutcome?.(outcome);
++    } catch (error) {
++      const message = error instanceof Error ? error.message : String(error);
++      logVerbose(`queue: onQueueOutcome callback failed: ${message}`);
++    }
++  };
+   const touchActiveSessionEntry = async () => {
+     if (!activeSessionEntry || !activeSessionStore || !sessionKey) {
+       return;
+@@ -1167,10 +1177,31 @@ export async function runReplyAgent(params: {
+       },
+     );
+     if (steerOutcome.queued) {
++      await notifyQueueOutcome({
++        status: "steered",
++        mode: "steer",
++        queueMode: resolvedQueue.mode,
++        queued: true,
++        sessionId: steerOutcome.sessionId,
++        target: steerOutcome.target,
++        gatewayHealth: steerOutcome.gatewayHealth,
++        enqueuedAtMs: steerOutcome.enqueuedAtMs,
++        deliveredAtMs: steerOutcome.deliveredAtMs,
++      });
+       await touchActiveSessionEntry();
+       typing.cleanup();
+       return undefined;
+     }
++    await notifyQueueOutcome({
++      status: "rejected",
++      mode: "steer",
++      queueMode: resolvedQueue.mode,
++      queued: false,
++      sessionId: steerOutcome.sessionId,
++      gatewayHealth: steerOutcome.gatewayHealth,
++      reason: steerOutcome.reason,
++      errorMessage: steerOutcome.errorMessage,
++    });
+     const summary = formatEmbeddedPiQueueFailureSummary(steerOutcome);
+     logVerbose(`queue: active session ${steerSessionId} rejected steering injection: ${summary}`);
+   }
+@@ -1196,6 +1227,14 @@ export async function runReplyAgent(params: {
+   });
+ 
+   if (activeRunQueueAction === "drop") {
++    await notifyQueueOutcome({
++      status: "dropped",
++      mode: "drop",
++      queueMode: resolvedQueue.mode,
++      queued: false,
++      sessionId: followupRun.run.sessionId,
++      reason: "active_run_drop",
++    });
+     typing.cleanup();
+     return undefined;
+   }
+@@ -1209,6 +1248,15 @@ export async function runReplyAgent(params: {
+       queuedRunFollowupTurn,
+       false,
+     );
++    await notifyQueueOutcome({
++      status: "queued_after_turn",
++      mode: "followup",
++      queueMode: resolvedQueue.mode,
++      queued: true,
++      sessionId: followupRun.run.sessionId,
++      target: "followup_queue",
++      enqueuedAtMs: followupRun.enqueuedAt,
++    });
+     // Re-check liveness after enqueue so a stale active snapshot cannot leave
+     // the followup queue idle if the original run already finished.
+     const queuedBehindActiveRun = isRunActive?.() === true;
+diff --git a/src/auto-reply/types.ts b/src/auto-reply/types.ts
+index 00505f153a..91da952455 100644
+--- a/src/auto-reply/types.ts
++++ b/src/auto-reply/types.ts
+@@ -2,6 +2,7 @@ export type {
+   BlockReplyContext,
+   GetReplyOptions,
+   PartialReplyPayload,
++  ReplyQueueOutcome,
+   ReplyThreadingPolicy,
+   TypingPolicy,
+ } from "./get-reply-options.types.js";

@@ -714,7 +714,7 @@ export default function App() {
 
         if (
           msg.id === curMsgId.current &&
-          (msg.status === "queued_after_turn" || msg.status === "steered_or_queued")
+          (msg.status === "queued_after_turn" || msg.status === "steered_or_queued" || msg.status === "steered")
         ) {
           setIsThinking(false);
           setRunState("idle");

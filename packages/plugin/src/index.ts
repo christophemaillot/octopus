@@ -165,6 +165,31 @@ function buildOctopusSessionKey(agentId: string, clientSession: string): string 
   ].join(":");
 }
 
+function queueOutcomeStatus(
+  outcome: any,
+  preference: DeliveryPreference | undefined,
+): "steered" | "queued_after_turn" | "accepted_by_pipeline" | undefined {
+  const rawStatus = String(outcome?.status ?? outcome?.disposition ?? "").toLowerCase();
+  if (rawStatus === "steered" || rawStatus === "steer") return "steered";
+  if (rawStatus === "queued_after_turn" || rawStatus === "followup") return "queued_after_turn";
+  if (rawStatus === "accepted_by_pipeline") return "accepted_by_pipeline";
+
+  const rawMode = String(
+    outcome?.mode ?? outcome?.queueMode ?? outcome?.deliveryMode ?? outcome?.kind ?? "",
+  ).toLowerCase();
+  const rawReason = String(outcome?.reason ?? outcome?.code ?? "").toLowerCase();
+  const queued = outcome?.queued !== false && outcome?.accepted !== false && outcome?.ok !== false;
+  if (!queued) return undefined;
+
+  if (rawMode.includes("followup") || rawReason.includes("followup")) return "queued_after_turn";
+  if (rawMode.includes("steer") || rawMode === "queue" || rawReason.includes("steer")) {
+    return "steered";
+  }
+  if (preference === "queue_after_turn") return "queued_after_turn";
+  if (preference === "steer") return "steered";
+  return undefined;
+}
+
 function canvasPath(pathname: string): string {
   const path = pathname || "/__openclaw__/canvas/";
   if (path.startsWith("/__openclaw__/canvas/") || path.startsWith("/__openclaw__/a2ui/")) return path;
@@ -402,6 +427,7 @@ export default definePluginEntry({
           let actualModel = selectedModel.id;
           let runStarted = false;
           let replyDelivered = false;
+          let queueOutcomeReported = false;
           let streamText = "";
           const sendLocalAssistantChunk = (data: any) => {
             const fullText = typeof data?.text === "string" ? data.text : "";
@@ -530,10 +556,24 @@ export default definePluginEntry({
               onItemEvent: (payload: any) => sendToolProgress(agentId, clientSession, msgId, payload),
               onCommandOutput: (payload: any) => sendToolProgress(agentId, clientSession, msgId, payload),
               onPatchSummary: (payload: any) => sendToolProgress(agentId, clientSession, msgId, payload),
-            },
+              onQueueOutcome: (outcome: any) => {
+                const status = queueOutcomeStatus(outcome, deliveryPreference);
+                if (!status) return;
+                queueOutcomeReported = true;
+                send({
+                  type: "message_delivery",
+                  id: msgId,
+                  agent: agentId,
+                  session: clientSession,
+                  status,
+                  deliveryMode: status === "steered" ? "steer" : "turn",
+                  code: outcome?.reason ?? outcome?.code ?? deliveryPreference ?? "configured",
+                });
+              },
+            } as any,
           });
 
-          if (!runStarted && !replyDelivered) {
+          if (!runStarted && !replyDelivered && !queueOutcomeReported) {
             const status = result?.queuedFinal
               ? "queued_after_turn"
               : deliveryPreference === "steer"
