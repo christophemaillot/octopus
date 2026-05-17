@@ -186,7 +186,6 @@ html, body, #root {
 .toolbar-spacer { flex: 1 1 24px; min-width: 12px; }
 
 .toolbar-model select,
-.toolbar-send-mode select,
 .toolbar-delivery-mode select {
   background: var(--bg);
   color: var(--text);
@@ -199,7 +198,6 @@ html, body, #root {
 }
 
 .toolbar-model,
-.toolbar-send-mode,
 .toolbar-delivery-mode,
 .context-gauge,
 .agent-availability,
@@ -516,9 +514,9 @@ html, body, #root {
 }
 
 .msg.user.pending {
-  opacity: 0.62;
-  border: 1px dashed rgba(255,255,255,0.45);
-  background: color-mix(in srgb, var(--accent) 70%, transparent);
+  opacity: 0.58;
+  background: color-mix(in srgb, var(--accent) 42%, var(--bg-pane));
+  color: color-mix(in srgb, white 72%, var(--text-dim));
 }
 
 .msg.user.steer {
@@ -634,14 +632,6 @@ html, body, #root {
   margin-top: 6px;
   display: flex;
   gap: 12px;
-}
-
-.msg-pending-label,
-.msg-delivery-label {
-  font-size: 10px;
-  color: rgba(255,255,255,0.75);
-  margin-top: 4px;
-  font-style: italic;
 }
 
 /* ── Tool call ──────────────────────────────────── */

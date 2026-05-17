@@ -9,6 +9,7 @@ interface ChatPaneProps {
   streamingContent: string | null;
   isThinking: boolean;
   toolCalls: ToolCall[];
+  activeUserMessageId?: string | null;
   runState: RunState;
   onSend: (content: string, immediate?: boolean) => void;
   onCancel: () => void;
@@ -20,6 +21,7 @@ export default function ChatPane({
   streamingContent,
   isThinking,
   toolCalls,
+  activeUserMessageId,
   runState,
   onSend,
   onCancel,
@@ -69,6 +71,18 @@ export default function ChatPane({
   }, [input]);
 
   const messages = thread?.messages ?? [];
+  const toolAnchorExists = !!activeUserMessageId && messages.some((msg) => msg.id === activeUserMessageId);
+  const renderStreamingTools = () => (
+    <div className="tool-panel">
+      <button className="tool-panel-toggle" onClick={() => setShowTools((v) => !v)}>
+        {showTools ? "▾" : "▸"} tools · {toolCalls.length}
+        {runState === "tool" && <span className="tool-live">running</span>}
+      </button>
+      {showTools && toolCalls.map((tc, i) => (
+        <ToolCallBadge key={`stream-${i}`} call={tc} />
+      ))}
+    </div>
+  );
 
   return (
     <div className="pane" style={{ display: "flex", flexDirection: "column", height: "100%" }}>
@@ -94,9 +108,6 @@ export default function ChatPane({
               <div className={`msg ${msg.role}${msg.status ? ` ${msg.status}` : ""}${msg.deliveryMode === "steer" ? " steer" : ""}`}>
                 {msg.deliveryMode === "steer" && <div className="msg-mode-badge" title="Message injecté dans le run en cours">↪ orienter</div>}
                 <FormattedMessage content={msg.content} />
-                {msg.role === "user" && msg.status && msg.status !== "sent" && (
-                  <div className="msg-delivery-label">{deliveryLabel(msg.status)}</div>
-                )}
                 {msg.usage && (
                   <div className="msg-footer">
                     {msg.model && <span>{msg.model}</span>}
@@ -109,21 +120,12 @@ export default function ChatPane({
                 )}
               </div>
             )}
+            {toolCalls.length > 0 && msg.id === activeUserMessageId && renderStreamingTools()}
           </div>
         ))}
 
         {/* Streaming tool calls */}
-        {toolCalls.length > 0 && (
-          <div className="tool-panel">
-            <button className="tool-panel-toggle" onClick={() => setShowTools((v) => !v)}>
-              {showTools ? "▾" : "▸"} tools · {toolCalls.length}
-              {runState === "tool" && <span className="tool-live">running</span>}
-            </button>
-            {showTools && toolCalls.map((tc, i) => (
-              <ToolCallBadge key={`stream-${i}`} call={tc} />
-            ))}
-          </div>
-        )}
+        {toolCalls.length > 0 && !toolAnchorExists && renderStreamingTools()}
 
         {/* Streaming content */}
         {isThinking && !streamingContent && (
@@ -181,21 +183,6 @@ function ToolCallBadge({ call }: { call: ToolCall }) {
       {call.summary && <span style={{ color: "var(--text-dim)" }}>— {call.summary}</span>}
     </div>
   );
-}
-
-function deliveryLabel(status: string): string {
-  switch (status) {
-    case "pending":
-      return "en attente locale";
-    case "accepted":
-      return "accepté";
-    case "steered":
-      return "steer / pipeline";
-    case "queued_after_turn":
-      return "après le tour";
-    default:
-      return status;
-  }
 }
 
 function FormattedMessage({ content }: { content: string }) {

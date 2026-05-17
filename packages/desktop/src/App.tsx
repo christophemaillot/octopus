@@ -72,9 +72,8 @@ export default function App() {
   const [selectedModels, setSelectedModels] = useState<Record<string, string>>({});
   const [replayStateLoaded, setReplayStateLoaded] = useState(false);
   const [runState, setRunState] = useState<RunState>("idle");
-  const [sendMode, setSendMode] = useState<SendMode>("queue");
+  const [sendMode] = useState<SendMode>("queue");
   const [deliveryPreference, setDeliveryPreference] = useState<DeliveryPreference>("steer");
-  const [pendingCount, setPendingCount] = useState(0);
   const [activeTool, setActiveTool] = useState<string | null>(null);
   const [actualModels, setActualModels] = useState<Record<string, string>>({});
   const [canvasPanel, setCanvasPanel] = useState<CanvasPanelState | null>(null);
@@ -227,7 +226,6 @@ export default function App() {
     sendTimerRef.current = null;
 
     const pending = pendingQueueRef.current.splice(0);
-    setPendingCount(0);
     if (pending.length === 0) return;
 
     const groups = new Map<string, PendingSend[]>();
@@ -291,7 +289,6 @@ export default function App() {
       model: agentModel,
       deliveryPreference,
     });
-    setPendingCount(pendingQueueRef.current.length);
     setRunState("queued");
 
     setThreads((prev) => ({
@@ -386,7 +383,6 @@ export default function App() {
         clearTimeout(sendTimerRef.current);
         sendTimerRef.current = null;
       }
-      setPendingCount(pendingQueueRef.current.length);
     }
 
     if (activeThread === threadId && curThreadRef.current === threadId && curMsgId.current) {
@@ -883,14 +879,11 @@ export default function App() {
           agentLabel={agentLabel}
           agentAvailable={agentAvailable}
           runState={runState}
-          sendMode={sendMode}
           deliveryPreference={deliveryPreference}
-          pendingCount={pendingCount}
           activeTool={activeTool}
           thinkingLevel={thinkingLevel}
           actualModel={actualModel}
           onModelChange={handleModelChange}
-          onSendModeChange={setSendMode}
           onDeliveryPreferenceChange={setDeliveryPreference}
           onOpenCanvas={() => {
             if (!activeAgent) return;
@@ -919,6 +912,7 @@ export default function App() {
               streamingContent={streamingContent}
               isThinking={isThinking}
               toolCalls={toolCalls}
+              activeUserMessageId={curMsgId.current ? `user-${curMsgId.current}` : null}
               runState={runState}
               onSend={handleSend}
               onCancel={handleCancel}
